@@ -1,0 +1,142 @@
+from __future__ import annotations
+
+import logging
+
+import numpy as np
+import pandas as pd
+
+log = logging.getLogger(__name__)
+
+
+def _shap():
+    """The shap module, imported on first use rather than with this module.
+
+    Serving only reads the SHAP summary written at training time (top_factors_for); it
+    never computes a SHAP value. Importing shap anyway cost the serving box 48 MB and 3 s
+    of every start, measured 2026-09-27, on a box killed at 512 MB.
+    """
+    try:
+        import shap  # type: ignore
+    except Exception:  # noqa: BLE001
+        return None
+    return shap
+
+# Rows explained per (region_id, lead_time_days) for the per-variable regressors. Measured
+# 2026-09-11 on the 2017 district models: TreeSHAP runs ~2,830 rows/s on a 300-tree
+# regressor and ~13,100 rows/s on the classifier. Explaining the full validation frame cost
+# ~86 min for the eight regressors (14.5 M rows) and ~0.5 min for the classifier (366 k
+# events). 25 rows per group takes the regressors to ~8 min. The classifier - the model
+# the region panel serves - is explained in full.
+SHAP_ROWS_PER_GROUP = 25
+
+
+def _stratified_sample(df: pd.DataFrame, group_cols, n: int | None, seed: int = 0) -> pd.DataFrame:
+    """At most `n` rows per group, reproducibly. None keeps every row."""
+    gcols = [c for c in group_cols if c in df.columns]
+    if n is None or not gcols or df.empty:
+        return df
+    order = np.random.default_rng(seed).permutation(len(df))
+    shuffled = df.iloc[order]
+    keep = shuffled.groupby(gcols, observed=True, sort=False).cumcount().to_numpy() < n
+    return shuffled[keep].sort_index()
+
+
+def _prep(df: pd.DataFrame, cols: list, categorical: list) -> pd.DataFrame:
+    X = df[cols].copy()
+    for c in cols:
+        if c in categorical:
+            X[c] = X[c].astype("category")
+        else:
+            X[c] = pd.to_numeric(X[c], errors="coerce")
+    return X
+
+
+def _shap_values(model, X: pd.DataFrame) -> np.ndarray | None:
+    shap = _shap()
+    if shap is None:
+        return None
+    try:
+        explainer = shap.TreeExplainer(model)
+        vals = explainer.shap_values(X, check_additivity=False)
+        if isinstance(vals, list):
+            vals = vals[-1]
+        return np.asarray(vals)
+    except Exception as exc:  # noqa: BLE001
+        # Still a fallback, no longer a silent one: the served explanation changes kind here.
+        log.error("SHAP failed (%s: %s); falling back to feature importance",
+                  type(exc).__name__, str(exc)[:200])
+        return None
+
+
+def explain_model(
+    model,
+    val_df: pd.DataFrame,
+    feature_columns: list,
+    categorical: list,
+    model_name: str,
+    group_cols=("region_id", "lead_time_days"),
+    max_rows_per_group: int | None = None,
+) -> pd.DataFrame:
+    if val_df.empty:
+        return pd.DataFrame()
+    val_df = _stratified_sample(val_df, group_cols, max_rows_per_group)
+    X = _prep(val_df, feature_columns, categorical)
+    sv = _shap_values(model, X)
+
+    if sv is not None and sv.shape == X.shape:
+        method = "shap"
+        contrib = np.abs(sv)
+    else:
+        method = "feature_importance_fallback"
+        fi = np.asarray(getattr(model, "feature_importances_", np.zeros(len(feature_columns))), float)
+        contrib = np.tile(fi, (len(X), 1))
+
+    # Row i of `contrib` is row i of `val_df`, and that is the only relationship worth
+    # relying on. Carrying val_df's own labels over and then grouping by them breaks as
+    # soon as a caller hands us a frame concatenated from batches, whose labels repeat:
+    # a label-based lookup pulls in every row sharing the label, so each group's mean
+    # drifts toward the overall mean - silently, since nothing raises and the panel still
+    # renders. Positional throughout instead.
+    contrib_df = pd.DataFrame(contrib, columns=feature_columns)
+    rows = []
+
+    overall = contrib_df.mean(axis=0)
+    for feat, v in overall.items():
+        rows.append(dict(model=model_name, group_region_id="__all__",
+                         group_lead_time_days=-1, feature=feat,
+                         mean_abs_shap=float(v), method=method))
+
+    gcols = [c for c in group_cols if c in val_df.columns]
+    if gcols:
+        # Keys given as positionally-indexed Series, matching contrib_df's own index, so
+        # one vectorised groupby replaces a per-group lookup over the whole frame.
+        keys_by_col = [pd.Series(np.asarray(val_df[c]), name=c) for c in gcols]
+        grouped = contrib_df.groupby(keys_by_col, observed=True, sort=False).mean()
+        for keys, means in grouped.iterrows():
+            keys = keys if isinstance(keys, tuple) else (keys,)
+            gr = dict(zip(gcols, keys))
+            for feat, v in means.items():
+                rows.append(dict(
+                    model=model_name,
+                    group_region_id=str(gr.get("region_id", "__all__")),
+                    group_lead_time_days=int(gr.get("lead_time_days", -1))
+                    if gr.get("lead_time_days") is not None else -1,
+                    feature=feat, mean_abs_shap=float(v), method=method,
+                ))
+    return pd.DataFrame(rows)
+
+
+def top_factors_for(shap_summary: pd.DataFrame, region_id: str, lead_time_days: int,
+                    model: str | None = None, k: int = 5) -> list:
+    df = shap_summary
+    if model:
+        df = df[df["model"] == model]
+    sel = df[(df["group_region_id"] == str(region_id)) &
+             (df["group_lead_time_days"] == int(lead_time_days))]
+    if sel.empty:
+        sel = df[df["group_region_id"] == "__all__"]
+    sel = sel.sort_values("mean_abs_shap", ascending=False).head(k)
+    return [
+        {"feature": r.feature, "importance": round(r.mean_abs_shap, 5), "method": r.method}
+        for r in sel.itertuples()
+    ]

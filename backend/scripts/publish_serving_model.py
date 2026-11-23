@@ -1,0 +1,325 @@
+"""Publish one finished run as the model the site serves.
+
+    python -m scripts.publish_serving_model --run-id run_20260922T043925Z [--deploy]
+
+Nothing here decides on its own that a model is good enough. It runs the SAME promotion
+gate the training pipeline uses (`train_pipeline._promotion_decision`) against whatever
+the site currently serves, and refuses when the gate refuses.
+
+What it checks, in order, before a single byte is uploaded:
+
+1. The run directory carries everything a serving box needs (install_serving_model's
+   REQUIRED_FILES, including shap_summary.parquet).
+2. The promotion gate, against the model the live artifact currently names.
+3. The API itself: the real published data bundle, this model dropped in, and the four
+   endpoints the dashboard calls - including a region's `top_factors`, which is the SHAP
+   explanation and a shipped feature. A model that loads but explains nothing is refused
+   here rather than discovered on the site.
+
+Then it uploads the bundle and its manifest to the `serving-model` release, and with
+--deploy dispatches the refresh workflow, which repacks and fires the Render hook.
+
+To go back to CI-trained models: `gh release delete serving-model`. The workflow falls
+back on its own, because the pinned model is a release that either exists or does not.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = SCRIPT_DIR.parent
+sys.path.insert(0, str(BACKEND_DIR))
+
+from scripts.install_serving_model import missing_files, sha256_of  # noqa: E402
+
+RELEASE_TAG = "serving-model"
+BUNDLE_NAME = "sanket-model.tar.gz"
+MANIFEST_NAME = "model.json"
+DATA_TAG = "data-latest"
+DATA_ASSET = "sanket-data.tar.gz"
+
+
+def _gh(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(["gh", *args], check=check, capture_output=True, text=True)
+
+
+def pack(run_dir: Path, out: Path) -> Path:
+    """The run directory alone, at the path a serving checkout expects it."""
+    run_id = run_dir.name
+    with tarfile.open(out, "w:gz") as tar:
+        tar.add(run_dir, arcname=f"data/models/{run_id}")
+    return out
+
+
+def fetch_live_bundle(dest: Path) -> "tuple[Path, str | None]":
+    """The published data artifact, and the run id it currently serves."""
+    _gh("release", "download", DATA_TAG, "-p", DATA_ASSET, "-D", str(dest), "--clobber")
+    with tarfile.open(dest / DATA_ASSET, "r:gz") as tar:
+        tar.extractall(dest)
+    current = dest / "data" / "models" / "current.json"
+    return dest, (json.loads(current.read_text()).get("run_id") if current.is_file() else None)
+
+
+def incumbent_as_of_issue(scores: Path, live_run_id: "str | None", test_year: int) -> dict:
+    """The served run's held-out skill as the site actually delivers it, for a like-for-like
+    gate.
+
+    A run trained with `forecast_error_lag` recorded its test score with the lag filled in,
+    an input no live forecast has (docs/known-issues.md). A run trained without it is
+    therefore refused against that figure for being honest. `scripts.score_run_on_year
+    --as-of-issue` scores the served run on the new run's test year the way live scoring
+    sees it, so the gate compares the two runs on the same year and on the same terms.
+    Refuses a file for another run, for another year, or one scored with the inputs filled in.
+    """
+    import pandas as pd
+    from app.ml import classifier as clf_mod
+
+    ev = pd.read_parquet(scores, columns=["y_bust", "model_proba", "scored_run_id",
+                                          "scored_year", "as_of_issue"])
+    runs = sorted(set(ev["scored_run_id"].astype(str)))
+    if runs != [str(live_run_id)]:
+        raise ValueError(f"{scores} scores {runs}, not the served run {live_run_id}")
+    years = sorted(set(ev["scored_year"].astype(int)))
+    if years != [int(test_year)]:
+        raise ValueError(f"{scores} is scored on {years}, not the new run's test year {test_year}")
+    if not ev["as_of_issue"].astype(bool).all():
+        raise ValueError(f"{scores} was not scored as of issue time "
+                         f"(scripts.score_run_on_year --as-of-issue)")
+    return clf_mod._evaluate(ev["y_bust"], ev["model_proba"])
+
+
+def shared_metrics(path: Path, run_id: str, live_run_id: "str | None", test_year: int):
+    """Both runs' metrics from one `scripts.score_shared_events` file: the same events,
+    the new run's label. Refuses a file for another run, incumbent or year."""
+    import pandas as pd
+    from app.ml import classifier as clf_mod
+
+    ev = pd.read_parquet(path)
+    for col, want in (("new_run_id", run_id), ("incumbent_run_id", live_run_id),
+                      ("year", test_year)):
+        got = sorted(set(ev[col].astype(str)))
+        if got != [str(want)]:
+            raise ValueError(f"{path} has {col} {got}, not {want}")
+    return (clf_mod._evaluate(ev["y_bust"], ev["proba_new"]),
+            clf_mod._evaluate(ev["y_bust"], ev["proba_incumbent"]))
+
+
+# How far the new run's score on the shared events may sit from the test score it recorded.
+# Both are the same run, year and inputs, read once from the training cache and once from
+# the store; a gap beyond float rounding means they are not the same events.
+RECORDED_SCORE_TOLERANCE = 0.002
+
+
+def check_recorded_score(shared_new: dict, metrics: dict) -> None:
+    recorded = ((metrics.get("classifier") or {}).get("test") or {}).get("roc_auc")
+    if recorded is None:
+        raise ValueError("the run recorded no held-out ROC-AUC to check the shared events against")
+    if abs(float(shared_new["roc_auc"]) - float(recorded)) > RECORDED_SCORE_TOLERANCE:
+        raise ValueError(f"the run scores {shared_new['roc_auc']:.4f} on the shared events but "
+                         f"recorded {float(recorded):.4f} on its own test year - these are not "
+                         "the events it was tested on; refusing")
+
+
+def refuse_incumbent_score_for_new_labels(manifest: dict) -> None:
+    """An --incumbent-score file is the served run on its own label. A label-version-2 run
+    is judged on a different label, so comparing the two is not like for like."""
+    if int((manifest or {}).get("label_version", 1)) >= 2:
+        raise ValueError("this run defines busts on bias-corrected error (label version 2): "
+                         "compare it with --shared-events (scripts.score_shared_events), not "
+                         "--incumbent-score")
+
+
+def gate_decision(new_metrics: dict, live_root: Path, live_run_id: "str | None",
+                  incumbent: "dict | None" = None) -> tuple:
+    """The training pipeline's own promotion gate, asked about this model against the
+    model the site serves. The gate reads the registry, so the registry is pointed at the
+    downloaded live bundle for the length of the question - the gate itself is untouched.
+
+    With `incumbent` (see incumbent_as_of_issue), the downloaded copy of the served run's
+    metrics carries that score as its held-out figure for the length of the question, with
+    the recorded one kept beside it, and goes back byte for byte afterwards. The published
+    artifact is never touched."""
+    from app.ml import registry
+    from app.ml.train_pipeline import _promotion_decision
+
+    saved_dir, saved_json = registry.MODEL_DIR, registry.CURRENT_JSON
+    metrics_path = live_root / "data" / "models" / str(live_run_id) / "metrics.json"
+    existed = metrics_path.is_file()
+    original = metrics_path.read_bytes() if existed else None
+    try:
+        registry.MODEL_DIR = live_root / "data" / "models"
+        registry.CURRENT_JSON = registry.MODEL_DIR / "current.json"
+        if incumbent is not None:
+            m = json.loads(original) if original else {}
+            clf = m.setdefault("classifier", {})
+            recorded = (clf.get("test") or {}).get("roc_auc")
+            clf["test"] = {**incumbent, "roc_auc_as_recorded": recorded}
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            metrics_path.write_text(json.dumps(m))
+        return _promotion_decision(new_metrics)
+    finally:
+        registry.MODEL_DIR, registry.CURRENT_JSON = saved_dir, saved_json
+        if incumbent is not None:
+            if existed:
+                metrics_path.write_bytes(original)
+            else:
+                metrics_path.unlink(missing_ok=True)
+
+
+def serving_check(live_root: Path, run_dir: Path) -> dict:
+    """Boot the API against the real published data with this model installed, and call
+    what the dashboard calls. Returns the observed facts; raises on anything not served."""
+    import shutil
+
+    run_id = run_dir.name
+    target = live_root / "data" / "models" / run_id
+    shutil.rmtree(target, ignore_errors=True)
+    shutil.copytree(run_dir, target)
+    (live_root / "data" / "models" / "current.json").write_text(
+        json.dumps({"run_id": run_id, "set_at": "serving-check"}))
+
+    env = {
+        "DATA_DIR": str(live_root / "data"),
+        "MODEL_DIR": str(live_root / "data" / "models"),
+        "CANONICAL_DIR": str(live_root / "data" / "canonical"),
+        "DB_PATH": str(live_root / "metadata.db"),
+        "LIVE_INGEST_ENABLED": "false",
+        "WARM_CACHES_ON_STARTUP": "false",
+        # The serving box has no GPU, so neither may this check. A pooled model is trained
+        # with device="cuda" and XGBoost keeps that in the saved JSON, so checking it on a
+        # machine that has a GPU would exercise a path the 512 MB box never takes and hide
+        # whatever it does instead. It also keeps the check off a GPU a training run may be
+        # using: contention there cost a variable a restart on 2026-09-22, when a
+        # concurrent finalize left too little VRAM for the trainer to allocate.
+        "CUDA_VISIBLE_DEVICES": "",
+    }
+    # A subprocess, because this process has already imported app.config with different
+    # paths, and settings are read once at import.
+    checker = SCRIPT_DIR / "_serving_check_worker.py"
+    proc = subprocess.run([sys.executable, str(checker), "--run-id", run_id],
+                          env={**os.environ, **env}, capture_output=True, text=True,
+                          cwd=str(BACKEND_DIR))
+    if proc.returncode != 0:
+        raise RuntimeError(f"serving check failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}")
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--run-id", required=True)
+    ap.add_argument("--dry-run", action="store_true", help="check and pack, upload nothing")
+    ap.add_argument("--deploy", action="store_true",
+                    help="after uploading, dispatch the refresh workflow so the site picks it up")
+    ap.add_argument("--shared-events", type=Path, default=None,
+                    help="scripts.score_shared_events output: this run and the served run on the "
+                         "same events and the same (this run's) label; the gate compares both "
+                         "metrics from it (see shared_metrics)")
+    ap.add_argument("--incumbent-score", type=Path, default=None,
+                    help="scripts.score_run_on_year --as-of-issue output for the served run on this "
+                         "run's test year: the gate compares against that instead of the score the "
+                         "served run recorded (see incumbent_as_of_issue)")
+    args = ap.parse_args()
+
+    from app.ml import registry
+
+    run_dir = registry.run_dir(args.run_id)
+    if not run_dir.is_dir():
+        print(f"no such run: {run_dir}", file=sys.stderr)
+        return 1
+    gaps = missing_files(run_dir)
+    if gaps:
+        print(f"{args.run_id} is missing {gaps} - not publishable. For a pooled run, "
+              f"`python -m scripts.train_pooled --finalize {args.run_id}` writes the "
+              f"SHAP summary.", file=sys.stderr)
+        return 1
+
+    metrics = registry.load_metrics(args.run_id) or {}
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        live_root, live_run_id = fetch_live_bundle(td / "live")
+        incumbent = None
+        man = run_dir / "manifest.json"
+        run_manifest = json.loads(man.read_text()) if man.is_file() else {}
+        if args.shared_events is not None and args.incumbent_score is not None:
+            print("give --shared-events or --incumbent-score, not both", file=sys.stderr)
+            return 1
+        if args.shared_events is not None:
+            test_year = run_manifest.get("test_year")
+            if test_year is None:
+                print(f"--shared-events needs {args.run_id}'s test_year in its manifest.json",
+                      file=sys.stderr)
+                return 1
+            shared_new, incumbent = shared_metrics(args.shared_events, args.run_id,
+                                                   live_run_id, int(test_year))
+            check_recorded_score(shared_new, metrics)
+            metrics = {**metrics, "classifier": {**(metrics.get("classifier") or {}),
+                                                 "test": shared_new}}
+            print(f"shared events, {test_year}: this run roc_auc {shared_new['roc_auc']:.4f}, "
+                  f"served run {live_run_id} roc_auc {incumbent['roc_auc']:.4f}")
+        if args.incumbent_score is not None:
+            refuse_incumbent_score_for_new_labels(run_manifest)
+            man = run_dir / "manifest.json"
+            test_year = json.loads(man.read_text()).get("test_year") if man.is_file() else None
+            if test_year is None:
+                print(f"--incumbent-score needs {args.run_id}'s test_year in its manifest.json",
+                      file=sys.stderr)
+                return 1
+            incumbent = incumbent_as_of_issue(args.incumbent_score, live_run_id, int(test_year))
+            print(f"served run {live_run_id} as of issue time on {test_year}: "
+                  f"roc_auc {incumbent.get('roc_auc', float('nan')):.4f}")
+        promote, why = gate_decision(metrics, live_root, live_run_id, incumbent)
+        print(f"currently served: {live_run_id}")
+        print(f"gate: {why}")
+        if not promote:
+            print("refusing to publish: the promotion gate said no", file=sys.stderr)
+            return 2
+
+        observed = serving_check(live_root, run_dir)
+        print(f"serving check: {json.dumps(observed)}")
+
+        bundle = pack(run_dir, td / BUNDLE_NAME)
+        manifest = {
+            "run_id": args.run_id,
+            "sha256": sha256_of(bundle),
+            "bytes": bundle.stat().st_size,
+            "gate": why,
+            "held_out": ((metrics.get("classifier") or {}).get("test")
+                         or (metrics.get("classifier") or {}).get("val") or {}),
+            "replaces": live_run_id,
+            "compared_against": ({"run_id": live_run_id, "as_of_issue": incumbent,
+                                  "shared_events": (str(args.shared_events)
+                                                    if args.shared_events else None)}
+                                 if incumbent is not None else None),
+        }
+        (td / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2))
+        print(json.dumps(manifest, indent=2))
+        if args.dry_run:
+            print("dry run: nothing uploaded")
+            return 0
+
+        _gh("release", "view", RELEASE_TAG, check=False)
+        if _gh("release", "view", RELEASE_TAG, check=False).returncode != 0:
+            _gh("release", "create", RELEASE_TAG, "--title", "Pinned serving model",
+                "--notes", "The model the site serves. Delete this release to return to "
+                           "CI-trained models.")
+        _gh("release", "upload", RELEASE_TAG, str(bundle), str(td / MANIFEST_NAME), "--clobber")
+        _gh("release", "edit", RELEASE_TAG, "--notes",
+            f"Serving model `{args.run_id}`\n\n```json\n{json.dumps(manifest, indent=2)}\n```")
+        print(f"published {args.run_id} to the {RELEASE_TAG} release")
+
+        if args.deploy:
+            _gh("workflow", "run", "refresh-data.yml")
+            print("dispatched refresh-data.yml; it will repack and trigger the deploy")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

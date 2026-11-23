@@ -1,0 +1,185 @@
+import { useState } from "react";
+import { useRegionDetail } from "../../hooks/useDashboardData";
+import { featureLabel, variableLabel } from "../../lib/displayNames";
+import { EmptyState, ErrorState, LoadingState, RiskBadge } from "../common/States";
+import { CopyLinkButton } from "../common/CopyLinkButton";
+import { retryingHint } from "../../lib/retryHint";
+import { BustProbabilityCurve } from "./BustProbabilityCurve";
+import { ShapFactorsList } from "./ShapFactorsList";
+import { VariableTrajectoryChart } from "./VariableTrajectoryChart";
+
+export function RegionDetailPanel({
+  regionId,
+  onClose,
+  riskCuts,
+}: {
+  regionId: string | null;
+  onClose: () => void;
+  riskCuts?: { medium: number; high: number };
+}) {
+  const { data, isLoading, error, failureCount } = useRegionDetail(regionId);
+  // Keyed by region so a newly opened district starts on its own leading driver, not on
+  // whichever tab the previous district was left on.
+  const [picked, setPicked] = useState<{ region: string; variable: string } | null>(null);
+  const activeVariable = picked && picked.region === regionId ? picked.variable : null;
+
+  if (!regionId) {
+    return (
+      <aside className="panel">
+        <EmptyState title="No region selected" message="Open a state on the map and pick a district — or search for one directly." />
+      </aside>
+    );
+  }
+  if (isLoading) return <aside className="panel"><LoadingState label="Loading region…" hint={retryingHint(failureCount)} /></aside>;
+  if (error) return <aside className="panel"><ErrorState error={error} /></aside>;
+  if (!data) return null;
+
+  if (!data.model_trained) {
+    return (
+      <aside className="panel">
+        <EmptyState title={data.region_name ?? regionId} message={data.message} />
+      </aside>
+    );
+  }
+
+  const available = data.variables.filter((v) => v.available);
+  const unavailable = data.variables.filter((v) => !v.available);
+  const worst = [...data.bust_probability_curve].sort((a, b) => b.bust_probability - a.bust_probability)[0];
+  const driver = available.find((v) => v.variable === worst?.dominant_variable) ?? null;
+  const current = available.find((v) => v.variable === activeVariable) ?? driver ?? available[0];
+  const showingDriver = driver != null && current?.variable === driver.variable;
+
+  return (
+    <aside className="panel">
+      <header className="panel__head">
+        <div>
+          <h2>{data.region_name ?? data.region_id}</h2>
+          <p className="muted small">
+            {data.region_id}
+            {data.init_date ? ` · cycle ${data.init_date}` : ""}
+          </p>
+        </div>
+        <div className="panel__actions">
+          {/* The URL carries this district and the lead day, so the panel is the one
+            * place a shareable link is genuinely worth offering. */}
+          <CopyLinkButton />
+          <button type="button" className="btn btn--ghost" onClick={onClose} aria-label="Close detail panel">×</button>
+        </div>
+      </header>
+
+      {data.message ? <p className="muted">{data.message}</p> : null}
+
+      {worst ? (
+        <section className="panel__section">
+          <h3>Peak bust risk</h3>
+          <div className="peak">
+            <span className="peak__value">{(worst.bust_probability * 100).toFixed(1)}%</span>
+            <div className="peak__meta">
+              <RiskBadge band={worst.risk_band} />
+              <span className="muted small">at lead day {worst.lead_time_days}</span>
+            </div>
+          </div>
+          {worst.dominant_variable ? (
+            <p className="muted small">Mostly driven by: {variableLabel(worst.dominant_variable).toLowerCase()}</p>
+          ) : null}
+        </section>
+      ) : null}
+
+      <section className="panel__section">
+        <h3>What the model relies on in this district (SHAP)</h3>
+        {data.top_factors.length ? (
+          <p className="panel__why">
+            What the model leans on here:{" "}
+            {data.top_factors.slice(0, 3).map((f) => featureLabel(f.feature)).join(", ")}.
+          </p>
+        ) : null}
+        <ShapFactorsList factors={data.top_factors} method={data.top_factors_method} />
+      </section>
+
+      <section className="panel__section">
+        <h3>
+          {showingDriver
+            ? <>Leading driver: {variableLabel(current.variable).toLowerCase()}</>
+            : "Forecast vs what actually happened"}
+        </h3>
+        {showingDriver ? (
+          <p className="muted small">
+            The variable pushing the peak bust risk at lead day {worst.lead_time_days}. Its
+            forecast against what was actually observed:
+          </p>
+        ) : null}
+        {available.length ? (
+          <>
+            <div className="tabs" role="tablist">
+              {available.map((v) => (
+                <button
+                  key={v.variable}
+                  role="tab"
+                  aria-selected={current?.variable === v.variable}
+                  className={current?.variable === v.variable ? "tab tab--active" : "tab"}
+                  onClick={() => setPicked({ region: regionId, variable: v.variable })}
+                  title={v.variable}
+                >
+                  {variableLabel(v.variable)}
+                  {driver?.variable === v.variable ? <span className="tab__chip">driver</span> : null}
+                </button>
+              ))}
+            </div>
+            {current ? (
+              <>
+                <VariableTrajectoryChart series={current} />
+                {current.max_lead_day ? (
+                  <p className="muted small">
+                    Modelled for Days 1–{current.max_lead_day} only: the reforecast archive the
+                    model learned from holds no {variableLabel(current.variable).toLowerCase()}{" "}
+                    beyond Day {current.max_lead_day}, so later days are not scored rather than
+                    guessed.
+                  </p>
+                ) : null}
+                <dl className="metrics">
+                  <div><dt>Average error (MAE)</dt><dd>{fmt(current.model_mae)} {current.unit ?? ""}</dd></div>
+                  <div><dt>Typical error (RMSE)</dt><dd>{fmt(current.model_rmse)}</dd></div>
+                  <div><dt>Variance explained (R²)</dt><dd>{fmt(current.model_r2)}</dd></div>
+                  <div><dt>Bust threshold</dt><dd>{fmt(current.bust_threshold)} {current.unit ?? ""}</dd></div>
+                </dl>
+                <p className="muted small">
+                  Average error is how far this variable&apos;s forecast lands from reality on a
+                  normal day{current.unit ? <>, in {current.unit}</> : null}. It counts as a bust
+                  once the error passes the threshold.
+                </p>
+                <p className="muted small">
+                  Measured on forecasts this model never trained on (the{" "}
+                  <b>{current.metrics_split ?? "unknown"}</b> split of the current run).
+                </p>
+              </>
+            ) : null}
+          </>
+        ) : (
+          <p className="muted">No variable has a trained model yet.</p>
+        )}
+        {unavailable.length ? (
+          <p className="muted small">
+            Not modelled (too few matched forecast–observation pairs):{" "}
+            {unavailable.map((v) => variableLabel(v.variable)).join(", ")}
+          </p>
+        ) : null}
+      </section>
+
+      <section className="panel__section">
+        <h3>Bust probability by lead day</h3>
+        <BustProbabilityCurve points={data.bust_probability_curve} cuts={riskCuts} />
+      </section>
+
+      <section className="panel__section">
+        <h3>Similar past cases</h3>
+        <p className="muted small">
+          Searching for similar past forecasts is not built yet, so nothing is shown here
+          rather than an invented match.
+        </p>
+      </section>
+    </aside>
+  );
+}
+
+const fmt = (v: number | null | undefined) =>
+  v == null || Number.isNaN(v) ? "—" : Number(v).toFixed(3);

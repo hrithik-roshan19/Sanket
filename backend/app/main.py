@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import threading
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from app.api.box_guard import BoxRequestGuard
+from app.api.routers import alerts, ensemble, ingest, model_status, regions, replay, upload, ws
+from app.config import settings
+from app.db.base import init_db
+from app.ml import registry
+from app.ml.inference import CycleNotPrecomputed
+from app.realtime.broadcaster import manager
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("forecastguard")
+
+# Read by /api/health: a young process after a slow page means a restart, not a slow endpoint.
+_STARTED = time.monotonic()
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    init_db()
+    manager.bind_loop(asyncio.get_running_loop())
+
+    try:
+        from app.utils.geo import get_resolver
+        get_resolver()
+        log.info("geo index ready")
+    except Exception:  # noqa: BLE001
+        log.exception("geo index failed to build; region resolution will degrade")
+
+    log.info("current model run: %s", registry.current_run_id() or "none (no model trained yet)")
+
+    if registry.current_run_id() and settings.warm_caches_on_startup:
+        def _warm_replay() -> None:
+            try:
+                from app.services import replay_service
+                n = len(replay_service.list_cycles())
+                log.info("guided-replay cache warm: %d cycles ranked", n)
+                from app.services import ensemble_service
+                ensemble_service.get_divergence()
+                log.info("ensemble-divergence cache warm")
+            except Exception:  # noqa: BLE001
+                log.exception("guided-replay warm failed (endpoint still works, just cold)")
+
+        threading.Thread(target=_warm_replay, name="replay-warm", daemon=True).start()
+    elif registry.current_run_id():
+        log.info("startup cache warm disabled; replay and ensemble will be cold on first call")
+
+    from app.live.scheduler import scheduler
+    scheduler.start()
+    try:
+        yield
+    finally:
+        scheduler.stop()
+
+
+app = FastAPI(
+    title="Sanket",
+    version="0.6.0",
+    lifespan=lifespan,
+    description=(
+        "Medium-range (Day 1-10) forecast-bust detection for Indian regions. "
+        "SIH 2026 PS 26079. Every number served here traces to a real upload and a real "
+        "trained model; when neither exists the API says so explicitly."
+    ),
+)
+
+# Innermost of the two, so a refusal still carries CORS headers. See app/api/box_guard.py.
+app.add_middleware(BoxRequestGuard)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.exception_handler(CycleNotPrecomputed)
+async def _cycle_not_precomputed(_request, exc: CycleNotPrecomputed) -> JSONResponse:
+    # 409, not 404: the cycle exists, this server just will not score it. See
+    # settings.serving_read_only.
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+app.include_router(upload.router)
+app.include_router(regions.router)
+app.include_router(alerts.router)
+app.include_router(model_status.router)
+app.include_router(ingest.router)
+app.include_router(replay.router)
+app.include_router(ensemble.router)
+app.include_router(ws.router)
+
+
+def _build_commit() -> str:
+    return os.getenv("RENDER_GIT_COMMIT") or os.getenv("BUILD_COMMIT") or ""
+
+
+def _rss_mb() -> "float | None":
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+# HEAD as well as GET: uptime monitors send HEAD, and @app.get alone answers it with 405.
+@app.api_route("/api/health", methods=["GET", "HEAD"], tags=["health"])
+def health() -> dict:
+    return {
+        "status": "ok",
+        "model_trained": registry.current_run_id() is not None,
+        "current_run_id": registry.current_run_id(),
+        "websocket_clients": manager.connection_count,
+        "commit": _build_commit(),
+        "memory_mb": _rss_mb(),
+        "uptime_s": round(time.monotonic() - _STARTED, 1),
+        "prebuilt": _prebuilt_status(),
+    }
+
+
+def _prebuilt_status() -> dict:
+    # Render's own health check calls this endpoint, so it must answer even if the check
+    # itself breaks: a failing health check restarts the box.
+    try:
+        from app.services import response_cache
+        return response_cache.status()
+    except Exception as exc:  # noqa: BLE001
+        return {"active": False, "files": 0, "built_at": None,
+                "reason": f"status check failed: {type(exc).__name__}"}
+
+
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+def _static_file(root: Path, full_path: str) -> Optional[Path]:
+    """The built file `full_path` names under `root`, or None - never a path outside it, and
+    never an exception for a path the OS cannot represent (`GET /%00` was a 500)."""
+    if not full_path or "\x00" in full_path:
+        return None
+    try:
+        candidate = (root / full_path).resolve()
+        ok = candidate.is_file() and candidate.is_relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    return candidate if ok else None
+
+
+if _STATIC_DIR.is_dir():
+    app.mount("/assets", StaticFiles(directory=_STATIC_DIR / "assets"), name="assets")
+
+    @app.api_route("/{full_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
+    def spa(full_path: str) -> FileResponse:
+        if full_path.startswith(("api/", "ws")):
+            raise HTTPException(status_code=404, detail=f"No such endpoint: /{full_path}")
+
+        if "\x00" in full_path:
+            raise HTTPException(status_code=404, detail="No such file")
+        candidate = _static_file(_STATIC_DIR, full_path)
+        return FileResponse(candidate or _STATIC_DIR / "index.html")
+
+    log.info("serving built frontend from %s", _STATIC_DIR)
+else:
+    log.info("no built frontend at %s; API only (use `npm run dev` for the UI)", _STATIC_DIR)

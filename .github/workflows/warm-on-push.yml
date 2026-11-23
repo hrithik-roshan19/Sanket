@@ -1,0 +1,101 @@
+name: Warm the box after a push deploy
+
+# Render's autoDeploy is OFF (render.yaml, confirmed live in the dashboard 2026-09-16) -
+# deploys are dispatched deliberately by refresh-data.yml's hook, not fired by a push. This
+# workflow's wait-for-new-build loop below still runs against whatever is live for any
+# backend/frontend/Dockerfile push, so a push that does NOT trigger a Render deploy just
+# times out its wait (~15 min) and checks whatever was already serving.
+#
+# Since PR #48 the box serves responses CI built (app/services/response_cache.py), so there
+# is nothing to warm - and a box WITHOUT a matching bundle must not be warmed at all. It
+# builds every screen live, holding the model and its frames, and a warm request on top of
+# a visitor is what OOM-killed it twice: 2026-09-26 20:03Z and 2026-09-27 13:03Z, the second
+# after a manual Render deploy of c35a54c ran ahead of refresh-data's matching bundle. So
+# this reads /api/health's `prebuilt` first, and only a box serving its bundle gets the one
+# sequential pass below, which reads files and confirms the deploy answers fast.
+#
+# This workflow never fails. Nothing downstream depends on it, the data is already live
+# and correct, and a warning is how it reports a box that needs refresh-data.yml.
+
+on:
+  push:
+    branches: [main]
+    # Only what actually rebuilds the image. A docs-only push deploys nothing.
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "Dockerfile"
+      - "docker-entrypoint.sh"
+
+concurrency:
+  # A newer push supersedes: warming a build that is already being replaced is wasted.
+  group: warm-on-push
+  cancel-in-progress: true
+
+env:
+  SITE: ${{ vars.SITE_URL || 'https://sanket-a0dd.onrender.com' }}
+
+jobs:
+  warm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Wait for the new build, then warm it
+        run: |
+          set -u
+          want='${{ github.sha }}'
+
+          get_commit() {
+            curl -fsS --max-time 30 "$SITE/api/health" 2>/dev/null \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin).get("commit",""))' 2>/dev/null || true
+          }
+          get_asset() {
+            curl -fsS --max-time 30 "$SITE/" 2>/dev/null \
+              | grep -o 'assets/index-[A-Za-z0-9_-]*\.css' | head -1 || true
+          }
+
+          base_asset=$(get_asset)
+          echo "waiting for $want at $SITE (asset before deploy: ${base_asset:-none})"
+
+          # 1. The precise signal: the box reports the commit it was built from.
+          # 2. If that is empty the env var is not set, so fall back to the served asset
+          #    hash changing - exact for a frontend push, silent for a backend-only one.
+          live=""; ready=""
+          for i in $(seq 1 60); do
+            live=$(get_commit)
+            if [ -n "$live" ] && [ "$live" = "$want" ]; then ready="commit"; break; fi
+            if [ -z "$live" ]; then
+              now=$(get_asset)
+              if [ -n "$base_asset" ] && [ -n "$now" ] && [ "$now" != "$base_asset" ]; then
+                ready="asset"; break
+              fi
+            fi
+            sleep 15
+          done
+
+          case "$ready" in
+            commit) echo "new build confirmed by commit after ~$((i * 15))s" ;;
+            asset)  echo "::notice::/api/health reports no commit; confirmed by asset hash change instead" ;;
+            *)      echo "::warning::could not confirm the new build within 15 min; warming whatever is serving" ;;
+          esac
+
+          # 3. Never send anything heavy to a box without its prebuilt bundle: it would build
+          #    live, and that is what OOM-killed it (see the header). A box whose /api/health
+          #    has no `prebuilt` key predates the field and is treated the same way.
+          prebuilt=$(curl -fsS --max-time 30 "$SITE/api/health" 2>/dev/null | python3 -c '
+          import json, sys
+          p = json.load(sys.stdin).get("prebuilt") or {}
+          print("active" if p.get("active") else "inactive: %s" % (p.get("reason") or "no prebuilt key in /api/health"))
+          ' 2>/dev/null || echo "inactive: /api/health unreadable")
+          echo "prebuilt responses: $prebuilt"
+          if [ "$prebuilt" != "active" ]; then
+            echo "::warning::$SITE is serving without a matching prebuilt bundle ($prebuilt). It builds every screen live, so this run sends it nothing. Dispatch refresh-data.yml to package and deploy a bundle that matches this code."
+            exit 0
+          fi
+
+          # 4. One sequential pass, to confirm the deploy answers fast. These are file reads.
+          for ep in /api/regions/all /api/ensemble /api/replay/cycles; do
+            t=$(curl -fsS --max-time 60 -o /dev/null -w '%{time_total}' "$SITE$ep" 2>/dev/null || echo failed)
+            printf '  %-20s %ss\n' "$ep" "$t"
+          done
+          exit 0

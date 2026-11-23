@@ -1,0 +1,223 @@
+"""Shared shapes, frozen so parallel workstreams cannot drift apart.
+
+Three things are consumed across workstream boundaries: the paired-row frame the trainer
+eats, the /api/model/status payload the dashboard reads, and the region panel that carries
+SHAP. The API halves live in `app/api/schemas.py` as Pydantic models already; what was
+missing was the paired frame, which is a pandas contract rather than a response body.
+
+Everything here is descriptive. Nothing in this module transforms data - it says what the
+shape must be and refuses anything else, so a change shows up as one loud failure in
+tests/test_contracts.py instead of quietly downstream.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+# The last lead day the GEFSv12 reforecast archive holds, for variables that stop short of
+# Day 10 - 10 m wind at 120 h, soil moisture at 72 h (VAR_SPEC max_lead_h in
+# scripts/fetch_gefs_reforecast_sample.py; tests/test_archive_lead_caps.py keeps the two in
+# step). Training never saw these variables past these days, so they are not scored there
+# either, though the live feed carries all ten.
+ARCHIVE_MAX_LEAD_DAYS: dict[str, int] = {
+    "soil_moisture_pct": 3,
+    "wind_speed_ms": 5,
+    "wind_direction_deg": 5,
+}
+
+# Measured against the real 2017 store on 2026-09-10 by running
+# fe.build_training_frame over one cycle: 10,695 rows, 28 columns. Not transcribed from
+# the feature code - printed from the frame it actually produces.
+#
+# C4 (2026-09-17) added the five district-descriptor columns - state_id, centroid_lat,
+# centroid_lon, area_km2, border_distance_km - printed from a real build_training_frame
+# call and inserted where attach_district_descriptors actually places them: right after
+# season, before ensemble_spread.
+#
+# C2 (2026-09-17) added the four time-lagged-ensemble columns - laf_pool_mean,
+# laf_pool_std, laf_pool_size, laf_spread_ratio - printed from a real build_training_frame
+# call and inserted where they actually land: right after jump_rel_climatology, before
+# month.
+#
+# C4 (2026-09-18) completed with elevation_mean - the district descriptor deferred
+# earlier for needing a new external fetch (scripts/fetch_grid_elevation.py). Printed
+# from a real call: lands right after border_distance_km, before ensemble_spread.
+#
+# C3 (2026-09-18) added the three MJO columns - mjo_rmm1, mjo_rmm2, mjo_amplitude
+# (scripts/fetch_mjo_index.py, NOAA PSL's OMI index) - printed from a real call: land
+# right after elevation_mean, before ensemble_spread.
+PAIRED_ROW_COLUMNS: tuple[str, ...] = (
+    "region_id", "variable", "valid_date", "forecast_value", "value_type",
+    "init_date", "lead_time_days", "ensemble_member_id", "observed_value",
+    "verification_status", "abs_error", "jump_abs_change", "jump_std",
+    "jump_sign_flips", "jump_rel_climatology",
+    "laf_pool_mean", "laf_pool_std", "laf_pool_size", "laf_spread_ratio",
+    "month", "season",
+    "state_id", "centroid_lat", "centroid_lon", "area_km2", "border_distance_km",
+    "elevation_mean",
+    "mjo_rmm1", "mjo_rmm2", "mjo_amplitude",
+    "ensemble_spread",
+    "ensemble_member_count", "pressure_rate_of_change", "moisture_rate_of_change",
+    "forecast_error_lag", "fc_atmospheric_moisture_kgm2", "fc_humidity_pct",
+    "fc_pressure_hpa", "fc_rainfall_mm", "fc_soil_moisture_pct", "fc_temperature_c",
+    "fc_wind_direction_deg", "fc_wind_speed_ms",
+    "historical_bust_frequency_region_season",
+)
+
+# The identity of one row. A duplicate on these keys means a double-counted member.
+EVENT_KEYS: tuple[str, ...] = ("region_id", "init_date", "valid_date", "lead_time_days")
+MEMBER_KEYS: tuple[str, ...] = EVENT_KEYS + ("ensemble_member_id",)
+
+# The label is NOT here on purpose. y_bust is applied after the chronological split,
+# because the bust threshold is computed on training rows only; a label sitting in the
+# paired frame would mean the threshold had already seen the held-out data.
+LABEL = "y_bust"
+
+# Expected dtype per column, as a numpy kind rather than an exact dtype: 'f' float,
+# 'i' integer, 'M' datetime, 'O' object/string, 'C' pandas categorical. Kinds, because
+# int32 vs int64 and category vs object are not worth failing a build over, while a float
+# column arriving as text is exactly what must fail.
+_KINDS: dict[str, str] = {
+    "region_id": "C", "variable": "C", "valid_date": "M", "forecast_value": "f",
+    "value_type": "C", "init_date": "M", "lead_time_days": "i",
+    "ensemble_member_id": "C", "observed_value": "f", "verification_status": "C",
+    "abs_error": "f", "jump_abs_change": "f", "jump_std": "f", "jump_sign_flips": "f",
+    "jump_rel_climatology": "f",
+    "laf_pool_mean": "f", "laf_pool_std": "f", "laf_pool_size": "f",
+    "laf_spread_ratio": "f",
+    "month": "i", "season": "C",
+    "state_id": "C", "centroid_lat": "f", "centroid_lon": "f", "area_km2": "f",
+    "border_distance_km": "f", "elevation_mean": "f",
+    "mjo_rmm1": "f", "mjo_rmm2": "f", "mjo_amplitude": "f",
+    "ensemble_spread": "f",
+    "ensemble_member_count": "i", "pressure_rate_of_change": "f",
+    "moisture_rate_of_change": "f", "forecast_error_lag": "f",
+    "fc_atmospheric_moisture_kgm2": "f", "fc_humidity_pct": "f", "fc_pressure_hpa": "f",
+    "fc_rainfall_mm": "f", "fc_soil_moisture_pct": "f", "fc_temperature_c": "f",
+    "fc_wind_direction_deg": "f", "fc_wind_speed_ms": "f",
+    "historical_bust_frequency_region_season": "f",
+}
+
+# Columns that are legitimately sparse, and why. Nulls here are real signal, never a
+# value to fill: soil moisture is masked past day 3 and wind past day 5 in the archive,
+# the lag features have no predecessor on the first cycle, and the historical bust
+# frequency is absent until a climatology exists. The jump_* columns (C1) and
+# laf_pool_std/laf_spread_ratio (C2) need earlier cycles covering the same valid date -
+# none exist at the reforecast's sampled density, where initialisations are 14-35 days
+# apart - and a climatology for the relative jump. laf_spread_ratio and laf_pool_std are
+# additionally NaN whenever this cycle itself has fewer than 2 surviving members. The
+# mjo_* columns (C3) are NaN before the OMI record begins (1991-01-01) or whenever the
+# as-of join finds no reading within MJO_ASOF_TOLERANCE_DAYS of init_date.
+NULLABLE: frozenset[str] = frozenset({
+    "pressure_rate_of_change", "moisture_rate_of_change", "forecast_error_lag",
+    "fc_atmospheric_moisture_kgm2", "fc_humidity_pct", "fc_pressure_hpa",
+    "fc_rainfall_mm", "fc_soil_moisture_pct", "fc_temperature_c",
+    "fc_wind_direction_deg", "fc_wind_speed_ms",
+    "historical_bust_frequency_region_season",
+    "jump_abs_change", "jump_std", "jump_sign_flips", "jump_rel_climatology",
+    "laf_pool_std", "laf_spread_ratio",
+    "mjo_rmm1", "mjo_rmm2", "mjo_amplitude",
+})
+
+# Columns that exist only because an observation arrived after the forecast was issued.
+# The first three are what the label is built from and are never model inputs.
+# How the feature frame is computed. A run records the version it was trained with in its
+# manifest (`feature_version`) and is always scored with that version, so a change to the
+# arithmetic never silently changes what an already-trained model receives.
+#   1 - the original arithmetic. Runs without a recorded version (run_20260922T043925Z).
+#   2 - wind direction on the circle: shortest-way abs_error, circular ensemble spread,
+#       and a time-lagged pool of unit vectors (2026-10-02).
+LEGACY_FEATURE_VERSION = 1
+FEATURE_VERSION = 2
+
+# What a bust is. A run records `label_version` in its manifest.
+#   1 - any of the eight variables' raw ensemble-mean error over its training p90.
+#   2 - bias-corrected error (app/features/bias.py): each district/variable/lead/season's
+#       training-mean error is removed first, so a bust is a forecast failure rather than a
+#       steady offset. Wind direction is not a label variable: a daily resultant direction
+#       is mostly noise in light wind, and 86.5% of its "busts" were angle arithmetic
+#       (docs/known-issues.md). It stays an input. (2026-10-02)
+LABEL_VERSION = 2
+LABEL_VARIABLES: frozenset[str] = frozenset({
+    "atmospheric_moisture_kgm2", "humidity_pct", "pressure_hpa", "rainfall_mm",
+    "soil_moisture_pct", "temperature_c", "wind_speed_ms",
+})
+
+# `forecast_error_lag` was a model input, and no live forecast can have it: it made every
+# held-out score better than live scoring (docs/known-issues.md, 2026-09-25 and 2026-09-28).
+# regressors.feature_columns refuses any of these as an input.
+OBSERVATION_DERIVED: frozenset[str] = frozenset({
+    "observed_value", "abs_error", "verification_status", "forecast_error_lag",
+})
+LABEL_INGREDIENTS: frozenset[str] = frozenset({"observed_value", "abs_error", "verification_status"})
+
+
+def _kind(series: pd.Series) -> str:
+    if isinstance(series.dtype, pd.CategoricalDtype):
+        return "C"
+    return series.dtype.kind
+
+
+def validate_paired_frame(df: pd.DataFrame) -> None:
+    """Raise ValueError unless `df` matches the paired-row contract.
+
+    Column order is not enforced - a reordered frame is still perfectly usable, and
+    failing on it would be brittle for no gain. Presence and dtype are enforced.
+    """
+    have, want = set(df.columns), set(PAIRED_ROW_COLUMNS)
+    missing, extra = sorted(want - have), sorted(have - want)
+    if missing:
+        raise ValueError(
+            f"paired frame is missing {missing}. If a feature was removed, update "
+            f"PAIRED_ROW_COLUMNS in the same commit.")
+    if extra:
+        raise ValueError(
+            f"paired frame has unexpected columns {extra}. A new feature must be added "
+            f"to PAIRED_ROW_COLUMNS deliberately, so every consumer sees it change.")
+
+    wrong = []
+    for col in PAIRED_ROW_COLUMNS:
+        want_kind, got_kind = _KINDS[col], _kind(df[col])
+        if want_kind == "C" and got_kind == "O":
+            continue          # a category that has not been made categorical yet
+        if want_kind == "i" and got_kind == "f":
+            continue          # an integer column carrying NaN is float in pandas
+        if got_kind != want_kind:
+            wrong.append(f"{col} (expected {want_kind}, got {got_kind})")
+    if wrong:
+        raise ValueError(f"paired frame has the wrong dtype for: {', '.join(wrong)}")
+
+
+def example_column(name: str, n: int) -> pd.Series:
+    """A contract-conforming column of arbitrary values, for tests.
+
+    Shape fixture only. These values are meaningless and must never reach anything that
+    produces a metric.
+    """
+    kind = _KINDS[name]
+    if kind == "M":
+        return pd.Series(pd.date_range("2017-01-01", periods=n, freq="D"))
+    if kind == "f":
+        return pd.Series(np.zeros(n, dtype="float64"))
+    if kind == "i":
+        return pd.Series(np.ones(n, dtype="int64"))
+    if kind == "C":
+        return pd.Series([f"{name}_{i}" for i in range(n)], dtype="category")
+    return pd.Series([f"{name}_{i}" for i in range(n)], dtype="object")
+
+
+# Physically possible values per canonical variable, inclusive, in canonical units. A member
+# value outside is a corrupt message, not weather: the archive holds two (2004-03-05 p03
+# Day-2 temperature at +-2e7 C; 2019-02-09 p01 Day-1 column water vapour at ~12,500
+# kg/m2). `engineering.drop_implausible` removes such rows before any frame is built.
+# Real 2017 extremes sit well inside: temperature -33.1..42.9, MSLP 985..1050, rain to 367.
+PLAUSIBLE_RANGE: dict = {
+    "temperature_c": (-80.0, 60.0),
+    "humidity_pct": (0.0, 100.5),
+    "rainfall_mm": (0.0, 1500.0),
+    "pressure_hpa": (870.0, 1085.0),
+    "wind_speed_ms": (0.0, 75.0),
+    "wind_direction_deg": (0.0, 360.0),
+    "soil_moisture_pct": (-0.5, 100.5),
+    "atmospheric_moisture_kgm2": (0.0, 100.0),
+}

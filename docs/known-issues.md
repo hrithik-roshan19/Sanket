@@ -1,0 +1,1612 @@
+# Known issues
+
+Things that are true, unfixed, and deliberate to leave. Written down so they are found
+here rather than discovered live.
+
+## Behaviour a visitor could notice
+
+- **A box woken from sleep is slow to answer at all.** Render's free tier stops the
+  instance after 15 minutes without traffic, and starting it again takes tens of seconds
+  before the app sees a request. Nothing in the app can shorten that; only traffic that
+  keeps it awake can (render.yaml: an external pinger on `/api/health`).
+- **Every screen is built in CI, not on the box** (`app/services/response_cache.py`).
+  Measured 2026-09-27 against the live bundle, a cold box-mode server answered every
+  dashboard request in 2–24 ms and stayed at 176 MB, where building on the box had taken
+  11–18 s for Replay on the live site and loaded the model. The files are keyed on the
+  model run and a hash of the backend source, so a **deploy that did not come from
+  `refresh-data.yml`** (Render's *Deploy latest commit*, as on 2026-09-27 13:00Z) runs
+  new code on the previous bundle and builds every screen live until the next refresh.
+  `/api/health` reports it (`prebuilt.active: false`, with the reason), warm-on-push then
+  sends it nothing, and the box builds one screen at a time, loading the models' names but
+  not the models (it never scores) and only the classifier's SHAP rows, which is all the
+  district panel reads. Measured on a fresh box-mode server, opening screen plus Replay
+  requested at once (macOS RSS, 2026-09-27): 1,060–1,211 MB with neither, 516–541 MB with
+  the one-at-a-time guard, 363–404 MB with the lean load as well - every one of the 689
+  screens identical. Not yet measured on Linux, whose Arrow allocator (jemalloc) differs
+  from macOS's (mimalloc); the numbers may not transfer. Deploying through
+  `refresh-data.yml` avoids the path entirely.
+- **The live site answers only what the dashboard asks for.** On the serving box
+  (`SERVING_READ_ONLY`) every write is refused with a 409 before its body is read, and a
+  read carrying a body with a 413 (`app/api/box_guard.py`). Parameters the dashboard never
+  sends are refused rather than built: `/api/ensemble?region_id=` or `?init_date=` and
+  `/api/replay?focus_region=` get a 409, a state's panel (`/api/regions/IN-MH`) and a
+  Replay date the bundle does not hold get a 404. `/api/regions?lead_time_days=N` is one day
+  cut from `/api/regions/all`. Each of these had loaded the model on the box: measured
+  2026-09-28 on a box-mode mirror, a 254-334 MB peak from about 160 MB per request, and a
+  single 15 MB upload body 161 to 424 MB. Run the API locally for any of them.
+- **The opening screen is one viewport on desktop only.** On phones the KPI strip, the
+  cue row and the ticker sit below the fold. The page scrolls and what is visible is
+  composed; only the single-screen effect is lost.
+- **Installable, but not offline.** There is a web app manifest, so the site can be added
+  to a phone's home screen and opens standalone. There is deliberately **no service
+  worker**: caching the app shell is what strands a visitor on a stale build, and the
+  recovery for someone already holding a bad one is poor. That is not a thing to ship
+  unattended in the days before a deadline. Anyone who opens it without a connection gets
+  the browser's offline page, not a cached last forecast.
+- **The app icon is 180×180, not the 512×512 a manifest wants.** The largest square source
+  in the repo is `apple-touch-icon.png`; there is no vector original. Android will scale
+  it, and on a splash screen that will be visibly soft. Upscaling it to 512 and declaring
+  it as such would only move the blur somewhere less honest — this needs a real source
+  file, not a resample.
+- **The map can get calmer at longer lead days, which looks backwards.** Forecasts do get
+  worse with lead, and on the 2017 test year the model's mean bust probability rises with
+  lead within each run of days that scores the same variables (0.43 → 0.53 over Days 1-3,
+  0.45 → 0.55 over Days 6-10). The 2026-09-25 map instead falls from 0.50 on Day 1 to
+  about 0.23 on Days 6-10. SHAP on the live classifier over that cycle's served events
+  (measured 2026-09-26) splits it three ways, and misses the main cause:
+  - **The model's own leak (found 2026-09-28).** The 2017 test-year figures above were
+    scored with `forecast_error_lag` filled in. Scored as live, with it blank, the same
+    September 2017 cycles fall from 0.399 on Day 1 to 0.313 on Day 10, while the real bust
+    rate rises from 0.371 to 0.495. See the `forecast_error_lag` entry. SHAP on the
+    classifier cannot show this: the leak acts inside the regressors, so it arrives as
+    lower `pred_err_*` inputs, which the split below reads as weather.
+  - **The weather.** Every cycle from 21 Sep forecast an active spell to 26 Sep, then calm
+    and dry. On the 25 Sep cycle, district-mean rain goes 13.0 → 3.9 mm from Day 1 to
+    Day 3 and stays near 3 mm; wind goes 4.4 → 1.7 m/s by Day 5. Busts scale with the
+    weather: on the live run's 2017 held-out events, where the predicted rainfall error
+    was under 2 mm the rain busted 0.5-0.7% of the time at every lead, Day 10 included,
+    against 49-58% where it was over 9 mm. The wind and rainfall inputs carry most of the
+    Day 1-3 drop.
+  - **Fewer variables are scored.** Soil moisture stops after Day 3 and wind after Day 5,
+    because the training archive holds nothing past those leads (lead-cap entry under
+    Data). An event busts if any scored variable busts, so from Day 4, and again from
+    Day 6, there are fewer ways to bust. The 2017 test year steps down at the same places
+    (actual bust rate 0.52 on Day 5, 0.42 on Day 6). On this cycle, wind going unscored
+    at Day 6 is worth about -0.36 log-odds.
+  - **The season input changes on 1 October.** Leads falling in October take the next
+    season's historical bust frequency, worth about -0.11 log-odds from Day 7 here.
+  - `lead_time_days` itself contributes about 0. Earlier maps had the opposite shape: the
+    12-17 Sep cycles rose from 0.29-0.38 on Day 1 to 0.43-0.58 on Day 10.
+- **Replay offers the 10 most recent cycles**, not every cycle in the store
+  (`replay_service._MAX_CYCLES`). Each candidate costs one scoring pass on first call.
+  Above them it offers four past events whose outcome is known, and it opens on the first
+  of them. How those were chosen, and what they are scored with, is under "Replay's past
+  events" at the end of this file.
+- **RESOLVED — feature and variable names used to render raw, in snake_case.**
+  `frontend/src/lib/displayNames.ts` now maps every modelled variable and every engineered
+  feature prefix (`pred_err_`, `spread_`, `conf_`, `fc_`) to plain English, with a
+  `prettify` fallback for anything added later. `ShapFactorsList`, the variable tabs in
+  `RegionDetailPanel`, `MissesCard` and `AlertsPage`'s "most common cause" all route
+  through it. Verified by audit 2026-09-23: two rollout gaps found and fixed in the same
+  pass — `RegionDetailPanel`'s "not modelled" list and `VariableTrajectoryChart`'s
+  "no model for X" message were still interpolating the raw column name directly rather
+  than calling `variableLabel`. Both now do. The raw name is still shown deliberately as a
+  `title` tooltip on the SHAP factor list, for anyone checking the feature list against the
+  model artifact.
+
+## Operational
+
+- **Scheduled refreshes run 3–5 hours late.** GitHub's cron is best-effort and queues on
+  shared capacity for public repos; all four daily slots fire, consistently late. It costs
+  nothing because the refresh is catch-up driven — each run ingests whichever of the last
+  four cycles the store lacks, oldest first — and the dashboard reports which cycle is
+  actually loaded rather than implying "now". Moving the schedule off the hour (`:23`)
+  already reduced queueing; the remaining delay is not controllable from here.
+- **Serving memory runs close to the 512 MB ceiling whenever the box builds live.**
+  Measured 442 MB after compaction, against 490 MB before. Serving CI's precomputed
+  responses the model is never loaded (nor xgboost, scikit-learn or shap imported):
+  176 MB locally on 2026-09-27; confirm on the instance with `/api/health`. The instance is killed rather than throttled if it is exceeded,
+  so anything that increases what is held at serve time needs measuring, not estimating.
+  `/api/health` reports the live figure because the platform paywalls its own metrics.
+- **The CI serving-memory harness is noisy.** The same store measured 566 MB and 510 MB
+  peak on consecutive runs, so it cannot resolve differences below roughly ±55 MB. Use it
+  for large effects only; for small ones read `/api/health` on the running instance, where
+  readings are stable.
+- **A district-grain ingest needs the machine to itself.**
+  `scripts/ingest_districts_chunked.py` splits a year by cycle so peak memory is set by the
+  chunk rather than the year. That holds — but the chunk is expensive. One cycle is 33,300
+  wide rows across 666 districts, melting to 209,790 long, and it peaks at **5,761 MB**.
+  Measured 2026-09-11 over 225 consecutive cycles of 2017: 4,947 MB on the first, rising to
+  5,761 MB by cycle 24, then flat for the 201 since — the cost of one chunk, not an
+  accumulation across them. So the script will not run on a box under 16 GB, and on a 16 GB
+  box it cannot share with much. Run alongside a dev uvicorn holding 1.4 GB and a browser,
+  it drove a laptop into continuous paging — 7.5 GB of 8 GB swap, load average above 13 —
+  and per-cycle time went from 60–90 s to 200–330 s, roughly doubling the wall time of the
+  run. Nothing is wrong when this happens and no cycle is corrupted; it is simply slow.
+  A death from memory pressure costs the cycle in flight rather than the run, because a
+  cycle already carrying its full district set is skipped on the next start.
+- **A district-scale retrain needs far more memory than the documented ~2.3 GB.** That
+  figure was measured at 36 districts. The 2017 retrain at 666 districts
+  (run_20260911T041126Z, 75,208,857 paired rows) measured a maximum resident set of
+  11.07 GB and a peak memory footprint of 42.9 GB including swap, and ran 10,425 s on a
+  16 GB laptop before failing at the event-frame step - so the classifier and SHAP stages,
+  which it never reached, may raise the true peak further. A 16 GB CI runner has no swap
+  to absorb that; district-scale training in CI is not assumed to fit until it has been
+  measured there. Measured 2026-09-11.
+- **Reading the store while an ingest writes to it killed a retrain twice over.** A reader
+  lists every batch file, then opens them; an ingest adds a file every ~18 s. Writing the
+  file straight to its final name let a reader open it without a footer. The first fix
+  wrote to `part-0.parquet.partial` and renamed — but pyarrow's discovery skips only names
+  starting with `.` or `_`, so the temp file was listed, renamed away, and the 2017 retrain
+  (run_20260911T082621Z) died with `FileNotFoundError` after 2,558 s. The temp name is now
+  `.part-0.parquet.partial`, and `test_store_atomic_write` reproduces the listing race.
+  Concurrency is safe for reads now, but the two still compete for memory: that run's
+  footprint was 13.4 GB beside the ingest's 4.9 GB. On a 16 GB box, run them in sequence.
+- **A two-year retrain (2017+2018, 152.3M paired rows) died with a MemoryError before a
+  single model trained** (run_20260911T193709Z, 1948 s in, on a 23.7 GB Windows box).
+  `_build_paired_in_chunks` builds each chunk, appends it to a list, then at the end
+  concatenates the whole list and calls `.sort_values(...).reset_index(drop=True)`. Two
+  wasteful copies stacked at exactly that point: the per-chunk `frames` list stayed alive
+  after being concatenated into `out` (both copies resident at once), and the separate
+  `.reset_index(drop=True)` call triggers pandas' block consolidation - a `np.vstack` of
+  every same-dtype column into one contiguous array - which tried to allocate 9.08 GiB it
+  did not need, since the sort had already produced the row order. Fixed by clearing
+  `frames` right after the concat and using `sort_values(..., ignore_index=True)` instead
+  of the separate reset (`test_sort_ignore_index_matches_sort_then_reset_index` pins the
+  two produce an identical frame). Removing one redundant copy is unlikely to be enough
+  headroom for three or more years pooled the same way - 152M rows x 16 float32 columns is
+  9 GiB for one array alone - so a third year repeating this failure is the signal to
+  change the structure (feed the model per year/chunk rather than materialising one pooled
+  frame), not to hunt for the next copy to delete.
+
+  **This is not only a "training on three years" limit - it bounds any two-train/one-test
+  evaluation too, once the training window is itself two years.** `_build_paired_in_chunks`
+  reads and materialises the whole frame spanning `[init_date_min, init_date_max]`
+  *before* `_choose_split`/`_split_by_year` ever divides it into train/val/test. So "train
+  on 2017+2018, test on 2019" and "train on 2017+2018+2019 pooled" cost the same memory
+  during the build - both span three years, whichever rows the split later assigns to
+  train versus test. "Train on 2018, test on 2019" is a different case and does fit: that
+  frame spans only two years (~152.6M rows, ~15.2 GB), the same proven scale as the
+  successful 2017+2018 run - which is exactly why it was chosen once the three-year
+  version was caught and killed. Measured
+  bytes/row on the downcast training frame: 99.31 (built from a real 2018-07-15 slice;
+  the schema has no object-dtype columns left after downcasting, all category/numeric, so
+  a reorder has no cheap pointer-only path either). Three years spanned = ~228.4M rows x
+  99.31 bytes ~= 22.7 GB resident for one copy of the frame alone, on a 23.7 GB box -
+  attempted 2026-09-12 (train 2017+2018, test 2019, `--init-date-min 2017-01-01
+  --init-date-max 2019-12-31 --test-year 2019`) and killed within seconds of launch once
+  this was worked out, before it could reach the point the first 2-year attempt died at.
+  Evaluating "does another year of training help" therefore needs the same structural fix
+  as pooling three years for training - an external-memory/QuantileDMatrix iterator fed
+  per chunk, not a full materialised frame - not merely a workaround for a bigger pool.
+  The fixed retry (run_20260911T201511Z) succeeded; its own peak was not measured - only
+  a >=12.7 GB reading at ~20 minutes in,
+  taken before other work intervened and the process finished unwatched. Measured
+  2026-09-11.
+- **A promotion string comparing two runs is only a like-for-like regression check when
+  both used the same kind of split.** `_choose_split` added a second split shape,
+  `_split_by_year`, alongside the original chronological `_split_by_cycle` - and
+  `_promotion_decision` compares held-out ROC-AUC across whichever two runs are current
+  and previous, with no awareness of which shape produced either number. run_20260911T163128Z
+  was scored on the chronological tail of 2017 (55 cycles, Nov-Dec); run_20260911T201511Z,
+  trained on 2017 and holding out all of 2018 (365 cycles), reported "held-out ROC-AUC
+  0.8348, 0.0117 below the previous run (0.8466)" - true as arithmetic, but the two 0.05-
+  tolerance numbers describe different test sets, not the same 55-cycle question asked
+  twice. Reading a sequence of promotion strings as if each were graded on the prior run's
+  own held-out set would be a mistake. The gate's behaviour is correct as designed and is
+  not being changed for this - the fix is in how these numbers get read, not in the gate.
+  A cross-year `--test-year` run's ROC-AUC should be compared to another cross-year run's,
+  not to a within-year run's. Measured/found 2026-09-11.
+- **The classifier's easiest two months are November and December, in both years
+  measured, and that is why validation scores above training.** run_20260911T201511Z
+  reported train ROC-AUC 0.8400, val 0.8796, test 0.8348 - val scoring above train looks
+  backwards until the calendar is checked. `_split_by_cycle`'s val slice is always the
+  chronological tail before test, which for a year trained start-to-finish is Nov-Dec; per
+  calendar month on the same run's eval frame:
+
+  | month | 01 | 02 | 03 | 04 | 05 | 06 | 07 | 08 | 09 | 10 | 11 | 12 |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | 2017 (train/val) | .865 | .863 | .838 | .843 | .842 | .843 | .814 | **.802** | .810 | .855 | **.876** | **.882** |
+  | 2018 (test)       | .847 | .843 | .848 | .831 | .823 | .824 | .813 | **.741** | .805 | .829 | **.870** | **.866** |
+
+  Nov-Dec are the top two or three months of the year in both 2017 and 2018 - training on
+  Jan-Oct and validating on Nov-Dec means the validation set is drawn from the model's
+  easiest season, not a representative one. The low point is consistently the monsoon
+  window (Jul-Sep, worst August both years - 0.802 in 2017, 0.741 in 2018), matching the
+  documented fact that rainfall is the hardest, most zero-inflated variable and the driver
+  of most busts. This also explains why the within-year test split (Nov-Dec 2017, ROC-AUC
+  0.8466) scored higher than the cross-year test (all of 2018, 0.8348, see the entry
+  above): the within-year test set was, again, the easiest two months, and the cross-year
+  test averages over an entire monsoon it had to face. Not a defect in the model or the
+  gate - a property of Indian monsoon seasonality that the current within-year split
+  happens to validate and test on its easiest months. Measured 2026-09-11 from
+  run_20260911T201511Z's own eval_events frame (`model_proba` vs `y_bust` grouped by
+  calendar month); no retrain required to reproduce.
+- **2019 collides with a filename the test suite already owns, and it was nearly
+  overwritten tonight.** `tests/conftest.py:37` hardcodes `gefs_reforecast_india_2019.
+  parquet`/`.csv` as the small 36-city legacy sample (30,600 rows, 36 columns - city/
+  state/region schema) that `_ingested_slice` and every test built on it depend on. 2019
+  was the very first year this project ever sampled, back when the unit was a city point;
+  nobody anticipated it would later also become a real district-scale archive year fetched
+  the same way 2017 and 2018 were, under the exact same filename pattern. Real district-
+  scale 2019 is 12,154,500 rows, 37 columns - a different row count, a different schema,
+  and a different unit of geography, so overwriting the legacy file would not have failed
+  loudly; it would have made every fixture that reads it silently wrong. `_finalise` wrote
+  the real 660 MB district parquet over the tracked 1.6 MB legacy one before this was
+  caught; `git status` showed it modified, `git restore` put it back, and a full green
+  suite (386 passed) confirmed the fixture's row/column counts were intact. No data was
+  lost, but it was close.
+
+  **Why it isn't renamed:** the obvious fix - give the legacy sample a name that doesn't
+  collide with a real archive year - touches `.github/workflows/setup.yml:47`, which
+  ingests `data/samples/gefs_reforecast_india_2019.parquet --confirm-all` by that literal
+  path. Editing a workflow is a decision this repo's standing rule reserves for the user
+  to make explicitly, not something to do unilaterally overnight. Also referenced by
+  `tests/conftest.py:37`, `scripts/README.md:10`, and `scripts/fetch_era5_observations.py`'s
+  docstring (2026-09-12).
+
+  **What was done instead, so 2017/2018/future years are unaffected:** the real 2019
+  archive lives at `data/samples/gefs_reforecast_india_2019_district.parquet` - an
+  inconsistent name next to 2017/2018's plain ones, forced by the collision, not a
+  stylistic choice. `scripts/ingest_districts_chunked.py` gained `resolve_source()` /
+  `--source` to point the ingest at a non-default filename (default behaviour for every
+  other year is unchanged). `scripts/fetch_gefs_reforecast_sample.py` gained `--no-csv`:
+  a district-scale year's CSV twin is tens of GB (measured ~12 GB for 2019 at daily
+  density) and nothing reads it - the ingest, the training pipeline and every test read
+  the parquet - so it is skipped for district years now rather than written and then
+  fought over. Renaming the legacy fixture properly, so 2019 does not need a special-
+  cased filename at all, is a real fix and is the user's call to make; not done tonight.
+- **The cross-year generalisation gap is stable across two independent year-pairs, not a
+  property of one pair.** Train-2017/test-2018 (run_20260911T201511Z): held-out ROC-AUC
+  0.8348. Train-2018/test-2019 (run_20260912T005532Z): held-out ROC-AUC 0.8327 - each
+  scored on a full calendar year it never trained on (n=2,400,930 events, 365 cycles).
+  0.0021 apart. That answers "does more data help, and is what we're seeing about the
+  model or about which year got picked": a model trained on one year loses only ~0.2-0.25
+  percentage points of ROC-AUC on the very next year, consistently, not by chance of
+  pairing. Measured 2026-09-12.
+- **More training years measurably help, scored the same way.** Four models, each scored
+  on the identical 2019 (n=2,400,930, via `scripts/score_run_on_year.py`, never trained on
+  2019): train-2016 (run_20260912T030448Z) 0.8302, train-2017 (run_20260911T163128Z)
+  0.8231, train-2018 (run_20260912T005532Z) 0.8327, train-2017+2018
+  (run_20260912T042847Z) 0.8418. Pooling two years beats every single-year model by
+  0.009-0.019 ROC-AUC. This required scoring, not a single `full_retrain` call: training
+  on 2017+2018 and testing on 2019 in one call would materialise all three years'
+  paired frame at once (the frame is built whole before the train/val/test split ever
+  divides it), which does not fit in 23.7 GB. The fix is two bounded processes - train
+  with `--init-date-min 2017-01-01 --init-date-max 2018-12-31 --dry-run` (2 years, fits),
+  then score the saved run separately with `score_run_on_year.py --year 2019` (1 year,
+  fits) - never more than 2 years resident in either process. Measured 2026-09-12.
+- **NOAA's public bucket has at least one file where the `.idx` sidecar is live but the
+  `.grib2` body 404s.** `soilw_bgrnd_2008112100_p01.grib2.idx` returns 200 and lists real
+  messages; the body 404s after 5 retries, while `p02`-`p04` the same cycle and `p01` the
+  day before/after are all fine - a genuine gap in the archive, not a transient fault. The
+  fetch script had a path for a missing idx (treat the file as absent, let
+  `cycle_is_complete` refuse just that cycle) but not for a missing body despite a live
+  idx, which propagated out of `pull_one_file` uncaught and crashed the whole month's CI
+  job rather than refusing the one cycle. Fixed 2026-09-12 to catch it the same way. Any
+  other year may hit the same pattern; it will now cost one refused cycle, not a failed
+  month.
+- **Swapping IMD gauge rainfall in for ERA5 did not move the pooled classifier ROC-AUC.**
+  `scripts/fetch_imd_district_rainfall.py` replaces precip_mm with IMD's gauge-based
+  product for 2016-2019 (mean |IMD - ERA5| = 3.3-4.0 mm/day, real and verified against the
+  live archive). A model trained on 2018 with IMD rainfall, scored on 2019 with IMD
+  rainfall (run_20260912T193709Z): 0.8328. The original all-ERA5 pairing
+  (run_20260912T005532Z): 0.8327. Indistinguishable. This is not the fetch or the merge
+  failing quietly - the store was spot-checked row for row against the IMD source file and
+  matches exactly - it is that the bust label is defined self-referentially: a variable
+  busts when its error exceeds *that variable's own* p90, computed on training data.
+  Swapping the ground truth moves the regressor's error, the p90 threshold, and the label
+  together, so a genuinely more accurate rainfall product does not automatically make the
+  classification problem more separable - it can relabel which days bust without changing
+  how separable busts are from non-busts. "More accurate ground truth" and "an easier
+  classification problem" are different claims; this measured that they can diverge.
+  Whether IMD rainfall improves anything downstream of the pooled AUC - the rainfall
+  regressor's own error, or SHAP attribution on rainfall-driven busts specifically - is
+  unmeasured and would need its own before/after, not read off this number. Measured
+  2026-09-13.
+- **The CNN loses to XGBoost by a wide, consistent margin, on two independent years.**
+  Same held-out cycles both models saw (run_20260912T193709Z, 2018, IMD rainfall
+  version), 3-seed CNN ensemble vs the tabular classifier: train 0.7721 vs 0.8505, val
+  0.7023 vs 0.8247, test 0.7454 vs 0.8711 - XGBoost ahead by 0.08-0.13 ROC-AUC on every
+  split. A separate one-off run on 2017 (run_20260911T163128Z, 1 seed) showed the same
+  pattern more sharply: XGBoost 0.8466 vs CNN 0.6840. (Both models are named explicitly
+  there because that pair is written in the opposite order to the three above it, where
+  the CNN is quoted first - read positionally rather than by name it says the CNN won.)
+  Plausible cause: ~2,550 training samples against
+  43,969 parameters is little sample efficiency margin for a CNN relative to a tree
+  ensemble on effectively tabular-shaped inputs. The CNN remains a challenger per
+  docs/engineering-reference.md, not a regression to fix - but two years now agree it is not currently
+  winning the ladder. Measured 2026-09-13.
+- **Pooling three years beats the best two-year pool, not just single years.**
+  `scripts/train_pooled.py` (app.ml.pooled_training) trains any number of years through
+  an XGBoost external-memory `DataIter`, never materialising more than one year at once -
+  built after three real crashes on this exact code path (see the entries above and
+  below) finding every remaining spot a redundant allocation could still exceed 23.7 GB.
+  Train-2016+2017+2018/test-2019 (run_20260913T162755Z): held-out ROC-AUC 0.8487, cross-
+  checked with `score_run_on_year.py` independently of the training run's own number.
+  Beats the best two-year pool (2017+2018, 0.8418) by 0.0069, and every single-year model
+  by 0.016-0.026. More data keeps helping past two years, at least up to three - whether
+  it keeps helping past three is unmeasured. Training ran in 7,511 s (2h5m) by splitting
+  the 8 variables across a GPU thread and a CPU thread (XGBoost's `train()` releases the
+  GIL, so this is genuine concurrent hardware use, not time-slicing) - measured 2.2x
+  faster per fit on GPU before wiring it in, and this run finished faster than the
+  CPU-only attempts even reached their crash point. Measured 2026-09-14.
+- **Getting here cost three real OOM crashes on the identical code path, each a different
+  allocation at the same ceiling.** In order: (1) a redundant `.copy()` after a boolean-
+  mask filter, in the new event-building pass, forcing pandas to consolidate blocks into
+  a second full-sized contiguous array; (2) an equally expensive `.drop(columns=...)`
+  a few lines later, doing the same block-reindex internally; (3) `pv.build_event_frame`'s
+  own internal `.copy()` (shared, unmodified code, safe for a single year alone) having
+  nowhere to allocate because the held-out test year was staying resident for the whole
+  function on top of whichever training year was being streamed. Each was found only by
+  running at real multi-year scale - none reproduced in the unit tests, which use frames
+  too small for a block-consolidation copy to be expensive. Fixed by removing the first
+  two outright and deferring the test year's load until after the event-building pass
+  that needed the headroom. Cost: roughly 9 hours of wall-clock across the failed
+  attempts before the working run above. Measured 2026-09-13/14.
+- **Block-bootstrap AUC intervals are coarse below roughly 20 held-out cycles.**
+  `app/ml/verification.py`'s `block_bootstrap_ci` resamples whole forecast cycles
+  (deliberately - workstream D1), but with only N
+  cycles there are only on the order of N distinct resample compositions the bootstrap
+  distribution can concentrate near, so the reported 95% interval is itself quantized
+  rather than smooth. Demonstrated directly with a hand-constructed 2-cycle case in
+  `backend/tests/test_verification.py`: the interval collapses to exactly the full
+  [min, max] range of the two cycles' own metric values, not a narrower band around the
+  point estimate. This is correct - it is the honest answer when independence gives you
+  only 2 samples - but it means the interval width should not be read as improving
+  smoothly as the held-out set grows; it improves in steps, one per additional
+  independent cycle.
+- **Single-cycle resampling made the intervals far too narrow, measured 2026-10-02.**
+  - Consecutive daily cycles are not independent either: each shares 9 of its 10
+    verified days with the next.
+  - On the served run's 2017 test set (2,430,900 events, 365 cycles), the 95% interval on
+    ROC-AUC 0.8435 was 0.0098 wide resampling single cycles, 0.0334 with 10-cycle blocks
+    and 0.0438 with 30-cycle blocks: 4.5x wider.
+  - The ladder now uses 30-cycle circular blocks (`run_baselines.CI_BLOCK_CYCLES`;
+    `block_len` in each interval records the length used).
+  - Earlier "more training years measurably help" gains of 0.007-0.019 sat inside these
+    wider intervals.
+- **The ladder lacked the baseline that needs no forecast at all, added 2026-10-02.**
+  Each (district, season)'s training bust rate (`district_season_frequency`) scored
+  ROC-AUC 0.6715 on the served run's 2017 test set, fitted on its 13.32 M baseline-fit
+  training events. That is above every baseline rung the ladder had: climatology 0.5000,
+  lead day 0.5095, spread 0.5996, lead+spread+season 0.6079, EMOS 0.6256, IDR 0.5987,
+  analog 0.6114 (its `baselines.json`). A model must clearly beat it to show it reads the
+  forecast rather than the calendar and the map.
+- **`fit_streaming` (the CNN training loop) was not bit-reproducible on CUDA with the
+  same seed - fixed 2026-09-17.** Workstream E1
+  required a test asserting two same-seed runs produce identical weights; none existed
+  before 2026-09-17. Added (`tests/test_train_cnn.py::test_same_seed_gives_bit_identical_
+  weights_on_{cpu,cuda}`): the CPU version passed outright from the start. The CUDA
+  version initially did not - every learned tensor differed, starting at the first
+  encoder layer, not late drift. Diagnosed, not just observed: forcing
+  `torch.use_deterministic_algorithms(True)` alone raised `RuntimeError`, naming cuBLAS's
+  GEMM algorithm selection specifically (CUDA >= 10.2 needs `CUBLAS_WORKSPACE_CONFIG` set
+  before the process starts). Two other candidates were suspected first and ruled out by
+  the same experiment: cuDNN convolution backward and `DistrictPooling`'s
+  `torch.sparse.mm` (a scatter-add, a classic nondeterministic-on-GPU shape) - neither
+  needed a fix once cuBLAS's was applied. **Fix applied, by the user's own instruction,
+  the same day:** `app/ml/train_cnn.py` now sets `CUBLAS_WORKSPACE_CONFIG=:4096:8` at
+  module import time (`os.environ.setdefault`, before torch initialises CUDA) and
+  `torch.backends.cudnn.deterministic = True` / `torch.use_deterministic_algorithms(True)`
+  inside `fit_streaming` (and `_fit_one`, the older CPU-only path, for consistency) right
+  after the seed is set. Both CUDA and CPU tests now pass for real, not `xfail`.
+  Deterministic algorithms cost some speed; not separately measured, and acceptable for a
+  43,969-parameter model that already trains in minutes. This does not reopen the
+  CNN-vs-XGBoost result (Section 0) - every CNN report to date used the CUDA path's
+  actual output, whatever it was seeded to produce; reproducibility of the weights was
+  never the same claim as correctness of
+  the comparison. Diagnosed 2026-09-17.
+- **The ONNX-serving memory/timing claim in `app/ml/cnn.py`'s `export_encoder` docstring
+  does not reproduce exactly on this machine.** Documented: "+51 MB, 490 ms for all 10
+  lead days". Re-measured 2026-09-17 (Windows, RTX 4060 laptop) with
+  `scripts/measure_cnn_onnx_serving_memory.py`, which - per workstream E4 - exports a real-shaped model (666
+  districts, 24 data channels) and measures a genuinely separate, torch-free subprocess
+  scoring 10 lead days one at a time: **+57.1 MB, 65 ms**. Memory is close (12% higher -
+  plausibly Windows `peak_wset` accounting for RSS differently than whatever produced the
+  original number, the same caveat already on record for `measure-serving-memory.yml`'s
+  cross-platform RSS readings, not evidence of a leak). Timing is not close: 65 ms is
+  roughly 7.5x faster than 490 ms, not slower, so this is not a regression - but it is a
+  different number on different hardware, and per the brief this gets reported rather
+  than quietly adopting the original. Neither `app/ml/cnn.py`'s docstring nor docs/engineering-reference.md
+  measured facts have been edited to match; both are one specific run's number, on
+  whatever machine and onnxruntime build actually produced it, and this repo's own rule
+  is not to overwrite a measured fact with a different machine's reading without saying
+  so - recorded here instead. Measured 2026-09-17.
+- **`fetch_gefs_reforecast_sample.py`'s CSV twin can silently stop a multi-year finalise
+  partway through, with no traceback.** Discovered 2026-09-17/18 finalising 2013-2015 from
+  already-cached dense parts (`--years 2013-2015 --stride 1 --resume`, no `--no-csv`):
+  2013 finalised correctly (parquet + a `.csv.partial` that never got renamed), but 2014
+  and 2015 were never touched at all - `_finalise` iterates years in a plain loop with no
+  per-year isolation, and the district-scale CSV twin is "tens of GB" (the docstring's own
+  words) per year. On a machine with ~38 GB free, 2013's CSV alone (12 GB, still `.partial`
+  when the process stopped) was enough to exhaust free disk before 2014 was ever reached -
+  and nothing printed an error to the captured output; the process just stopped. `--no-csv`
+  exists precisely because "nothing reads it downstream" (the ingest, training, and every
+  test read the parquet only) - use it for any multi-year finalise, not just as an
+  optimisation. Fixed by deleting the runaway `.partial` and re-running 2014/2015 with
+  `--no-csv`; both finalised correctly once disk pressure was gone. Measured 2026-09-18.
+- **Subprocess isolation for the per-year event-building worker was not, by itself,
+  enough - the crash it was built to prevent recurred inside it.** `_build_pooled_year_
+  events_worker.py`'s own docstring already documented the 2026-09-15 (v9) crash this
+  subprocess exists to avoid: `ArrayMemoryError` in pandas' groupby internals, ~586 MiB,
+  on a full year's row count. It recurred anyway, twice, each ~1.8 hours into a real
+  3-year pooled run (2026-09-17/18) - process isolation stopped it accumulating ACROSS
+  years, but within one worker's own lifetime, `fold_models` (real XGBoost Booster
+  objects, up to 24 of them for 8 variables x 3 folds) and the `job` dict holding them
+  stayed resident through the whole OOF-prediction loop and were never freed before
+  `build_event_frame`'s own big allocation needed its contiguous block.
+  `full_retrain_pooled` itself already does exactly this cleanup
+  (`del fold_models; gc.collect()`) - but only after the subprocess RETURNS, which never
+  helped the worker's own peak. Fixed by freeing `fold_models`/`job` explicitly inside
+  the worker, right before the call that needs the headroom, plus a retry
+  (`_run_year_events_subprocess` now tries twice) since a fresh OS process is a
+  genuinely different memory state, not a hope - at ~1.8 hours to reach this point,
+  losing the whole job to one allocation is a far worse trade than the retry's cost.
+  Per the existing caveat on this exact class of fix elsewhere in this file: Python's GC
+  cannot defragment a process's native heap, only the OS reclaiming the whole process
+  can - `gc.collect()` reduces the chance, it does not guarantee it, which is why the
+  retry exists too. Not yet re-verified against a full real run (each attempt costs
+  ~1.8 hours to even reach this point) - fixed and reasoned from the diagnosis, not
+  re-measured end to end. Found 2026-09-18.
+
+## Geography
+
+- **Pressure error is dominated by elevation, not by forecast difficulty.** (Corrected
+  2026-10-04: the variable is mean-sea-level pressure, `pressure_hpa` from `mslp_hpa` on both
+  sides; surface pressure is never a label. The elevation effect is real all the same: below
+  ground, MSLP is an extrapolation, and two models' reductions disagree most where there is
+  most terrain to reduce through.)
+  Median absolute pressure error per district on the held-out split of
+  `run_20260910T064804Z`, worst first: Leh **5.32 hPa**, Srinagar 2.56, East Sikkim 1.90,
+  Shimla 1.83, Papum Pare 1.77 — against an all-district median of **0.555**. The best are
+  Jaipur 0.45, Lakshadweep 0.48, Hyderabad 0.49. That ordering is elevation, not weather:
+  Leh sits at ~3,500 m and runs about **10× the typical district**.
+
+  So a "pressure bust" at a high-altitude district is mostly a statement about the station,
+  and the per-variable p90 threshold — computed **pooled across districts** — is too tight
+  there and too loose in the plains. The labels are still self-consistent, and this does
+  not invalidate the headline scores, but it does mean pressure contributes label noise
+  that is spatially structured rather than random.
+
+  Found while picking a case study for the deck: the rule-based pick returned Leh with a
+  19.26 hPa pressure error at 7× its threshold, which would have been presented as a
+  caught bust to a room of forecasters. `scripts/ppt_figures.py` now excludes
+  (district, variable) pairs whose own median error exceeds twice the all-district median.
+  **Not fixed in the model**: the real fix is either a per-district threshold or reducing
+  pressure to a common level before differencing, and both change the label definition, so
+  neither is a thing to do days before a deadline.
+
+- **Simplification silently deletes island districts, and the check that was meant to
+  catch it cannot.** The map's TopoJSON is built with `-simplify percentage=12%
+  keep-shapes`, and `keep-shapes` guarantees one ring per *feature*, not per part. Every
+  district made of several pieces therefore kept its largest and lost the rest: **700 rings
+  across 64 districts** (North & Middle Andaman 119 → 5, Kachchh 106 → 11). The pipeline's
+  own check — that all 666 districts survive — passes regardless, because the feature is
+  still present with pieces missing from inside it.
+
+  Lakshadweep is nothing but small islands, so it lost 23 of 24 and the union territory
+  was **absent from the map of India** in a way no automated check noticed. What remained
+  measured 0.64 × 1.23 units in a 620 × 680 viewBox — under one CSS pixel on a desktop,
+  a third of one on a phone — and its click target was the same size.
+
+  Fixed on both sides, and both halves were needed: `restore_island_rings.py` puts the
+  550 missing rings back after mapshaper (383 KB → 415 KB, every pre-existing vertex
+  within 45 m), and `IndiaChoroplethMap` draws a marker for any region whose projected
+  area falls under 30 square units. Geometry alone was not enough — restored at true
+  scale the islands are still sub-pixel, which is *why* the marker exists rather than
+  being a shortcut around the geometry.
+
+  Still open: **10 of Lakshadweep's 24 islands are degenerate at the shipped
+  quantisation** (0.0006°, against islets of 0.003°), so they carry position but not
+  shape. Nothing on the map depends on their shape today; if a drill-down ever needs it,
+  that file needs finer quantisation, not gentler simplification — measured, 70%
+  simplification still keeps only 3 of the 24 islands at 860 KB.
+
+- **Display and aggregation boundary geometry are the same GADM 4.1 file now**, not two
+  separate ones — the project notes' remark about them being reviewed separately predates the
+  districts migration. India's 2021 Geospatial Data Guidelines (DST, 15 Feb 2021, clause
+  xiii) name Survey of India boundary data as the standard for any political map of
+  India; this project's district inclusion already matches India's official territorial
+  position by design (see `build_district_geo.py`), but nobody has compared GADM's
+  boundary *lines* against SoI's own data, and no such comparison is recorded anywhere.
+  Full writeup, sources, and a Datameet alternative comparison: `docs/boundary-geometry-licensing.md`.
+
+- **RESOLVED 2026-09-23 — the live operational feed did not go through the district
+  weight table.** Fixed the same day this was found; see the full RESOLVED entry under
+  "Serving a pooled model" near the end of this file for what shipped and how it was
+  verified live. Kept here, like that entry, because the reasoning below on why the
+  obvious fix (packaging CDS observations alone) would not have moved the map is the
+  record of how this was decided — not because the problem is still open.
+  Training and reforecast ingestion aggregate every 0.25° cell a district polygon
+  overlaps, via
+  `india_districts.DistrictGrid.aggregate` (`fetch_gefs_reforecast_sample.py`,
+  `fetch_era5_cds_district_observations.py`). The live path does not: `app/live/gefs.py`
+  reads `scripts/india_cities.json` - **36 city points, one per state/UT** - and samples
+  `ds[sn].sel(latitude=..., longitude=..., method="nearest")`. Neither `app/live/gefs.py`
+  nor `app/live/orchestrator.py` references the weight table at all. Those rows are then
+  geo-resolved onto district `region_id`s, so a live row and a training row can carry the
+  same `IN-WB-KOLKATA` while having been produced by two different spatial methods -
+  area mean over the polygon in one case, value of the single nearest grid centre in the
+  other.
+
+  This is the method the engineering reference's Geography section specifically rejects, and Kolkata is
+  one of the ten districts it names as containing *no grid centre at all* - so for that
+  district the live value comes from a cell whose centre lies outside it. Kolkata and
+  Hyderabad are both in `india_cities.json`.
+
+  Scale of the disagreement is already measured, in the engineering reference's validation of the
+  district method against the 35 city points it replaced: correlation 0.9896, median
+  absolute difference 0.31 °C. Small next to the temperature bust threshold of 4.45 °C,
+  so this is a consistency problem rather than a visibly wrong number - but it is a
+  train/serve geography mismatch, and the engineering reference's "there is exactly one weight table"
+  and "both sides of the bust label are area means over the same polygon" describe the
+  archive path only, not what the deployed site ingests each cycle.
+
+  Consequence a visitor sees: the live deployment scores **36 regions**, not 666. The
+  About page discloses "city points, not full regional coverage of India", which is
+  accurate for the live feed and stale for the archive work. Not fixed here: moving the
+  live path onto the weight table means pulling gridded fields rather than points per
+  cycle, which is a real change to the live fetch's cost and failure modes, and not
+  something to do untested. Found 2026-09-20.
+
+## Data
+
+- **Two corrupt member-days in the reforecast archive. Dropped from 2026-10-04.** Found by
+  `scripts/diagnose_label_drift.py` over 2000-2019: member `p03` of 2004-03-05, Day 2 2 m
+  temperature, -23,380,072 to +21,808,336 C in all 666 districts (other members -18.5 to
+  32.4); member `p01` of 2019-02-09, Day 1 column water vapour, 12,500-12,546 kg/m2 (others
+  0.7-55.3). 2004 is a training year: one such member put that year's temperature RMSE at
+  34,612 C, and a per-(district, lead, month) bias would carry it into every spring Day 2.
+  `engineering.drop_implausible` now removes any value outside
+  `contracts.PLAUSIBLE_RANGE` at the start of `build_training_frame`, the path training,
+  scoring, live and replay share; the ensemble is then the members left. On the real store
+  it drops exactly 666 rows on each of those cycles and none on a clean one (2017-07-01).
+  The run that is served trained with the 2004 member in it.
+
+- **17 reforecast cycles are missing from the 2000-2019 store** (`canonical_full`, counted
+  2026-10-04 from Parquet footers: 7,288 of 7,305 days). 2004: Sep 13, Sep 26, Oct 7,
+  Oct 11, Oct 29, Nov 1, Nov 2, Nov 12, Dec 6, Dec 16. 2006: Jan 13, Feb 27, Aug 25,
+  Sep 15, Sep 26. 2008: Nov 21, Dec 16. The cause was not recorded at ingest; the fetch
+  refuses incomplete cycles rather than storing part of one, which is the likely reason.
+  Training and every score simply have no events on those dates. Refetching them is a
+  fetch-once question (CONTRIBUTING.md rule 7), not a quiet fix.
+- **GEFS 2 m humidity runs much drier than ERA5 at Day 1.** Nov 2017, 666 districts:
+  forecast minus observation -16.1 %RH on average (district 10th percentile -32.6), against
+  -0.03 C for temperature and -0.1 hPa for MSLP. Before bias correction this made the
+  humidity bust threshold 27.6 %RH; after a per-district, per-lead correction it is 10.4.
+  This is why label version 2 defines busts on bias-corrected error.
+
+- **A packaged cycle verifies as its observations arrive; what the model said does not
+  change.** Each CI run re-reads the observations of every cycle in Replay's window and
+  keeps each prediction exactly as first packaged (`inference.refresh_observations`).
+  Before 2026-09-28 the first artifact was re-packaged unchanged, so a live cycle - scored
+  before its days had happened - never verified (09-21 and 09-22 held 0 observations while
+  the store had 284 of each one's cells). Two exceptions, both deliberate:
+  - The retired 36-city-point cycles (live feed before 07d9835, up to 22 Sep) keep the
+    observations they were scored with. The store now holds district area means for those
+    days, and pairing them would verify a point forecast against a polygon mean. They
+    leave Replay's window by about 2 Oct.
+  - A newly promoted model has no artifacts, so it scores the window fresh, and a fresh
+    score fills `forecast_error_lag` from whatever observations have arrived by then - the
+    leak above, on cycles that are days old. It does not arise while the model is pinned.
+- **`docs/results.md` is generated, not committed.** Baselines are written into the model
+  run that produced them and served from there, so the numbers cannot describe a different
+  model than the one answering requests. The repo previously held a results file naming a
+  superseded run.
+- **Provisional observations are excluded from training** and badged in the UI. Verifying
+  against a different product than the model was trained on would shift both the error and
+  the bust label derived from it.
+- **The CDS needs two licences accepted, not one.** ERA5 requires
+  `licence-to-use-copernicus-products` *and* `cc-by`. The second does not appear in the
+  portal licence list (`get_licences(scope="dataset")`) - it is only reachable as a
+  `rel: license` link on the dataset itself. With just the first accepted, every request
+  returns `403 required licences not accepted`, which reads like a client fault and is
+  not. Measured 2026-09-10.
+- **The CDS ignores `download_format: unarchived`.** A multi-variable ERA5 request comes
+  back as a zip of two NetCDF files split by `stepType` - accumulations
+  (`total_precipitation`) in one, instantaneous fields in the other. Opening the
+  downloaded `.nc` directly fails; it is a zip. The time coordinate is `valid_time`, not
+  `time`. Both verified against a real download rather than documentation.
+- **ERA5 stamps an accumulation with the end of its hour.** `total_precipitation` at
+  00:00 on the 2nd is rain that fell 23:00-24:00 on the 1st, so every variable is grouped
+  by `valid_time - 1h`. That makes an observation day the half-open window `(t-24h, t]`,
+  which is deliberately the convention the forecast side already uses for day *k* -
+  `((k-1)*24, k*24]` - so both sides of a bust label describe the same interval. The
+  consequence: a complete day needs stamps `01:00..00:00` of the next day, so a per-month
+  request loses its final day unless it also pulls the first hour of the month after. The
+  fetch does, and drops the spillover.
+- **IMD dates each rain day by the END of its 0830 IST window, so IMD's date D is model
+  date D-1.** IMD's gauge day accumulates 0830 IST to 0830 IST (0300-0300 UTC); Sanket's day
+  is midnight to midnight UTC on both sides - `((k-1)*24, k*24]` per rule 4, `(t-24h, t]` in
+  `to_daily`. The rainfall IMD labels D covers 0830 IST on D-1 to 0830 IST on D, sharing 21
+  hours with model day D-1 and 3 with model day D. `fetch_imd_district_rainfall.py`
+  originally joined IMD's D to model day D, following the team brief's statement that IMD
+  attributes to the *starting* day. That put every IMD rainfall value one model day late: a
+  forecast for day D was verified against mostly the previous day's rain. IMD's own product
+  page (imdpune.gov.in, `Rainfall_25_NetCDF.html`) states no date convention at all, so this
+  was settled from data, measured 2026-09-17. Spearman correlation of IMD district rainfall
+  on IMD date D against independent hourly reanalysis rainfall summed to UTC day D+k, at the
+  district centroid:
+
+  | reference, period | districts | peak at k=-1 | mean at k=-1 | k=0 | k=+1 |
+  |---|---|---|---|---|---|
+  | ERA5 (Open-Meteo), Jun-Sep 2018 | 8 | 8 of 8 | 0.698 | 0.556 | 0.411 |
+  | MERRA-2 (NASA POWER), Jun-Sep 2018 | same 8 | 8 of 8 | 0.810 | 0.621 | 0.410 |
+  | ERA5, Jun-Sep 2017 | 5 | 5 of 5 | | | |
+  | ERA5, Oct-Dec 2017 (NE monsoon, Ockhi) | 5 | 5 of 5 | | | |
+
+  2018: Idukki, Ernakulam, Dakshina Kannada, Kolkata, Kamrup Metropolitan, Nagpur, Bhopal,
+  Mumbai City. 2017: Idukki, Dakshina Kannada, Kolkata, Nagpur, Mumbai City; then
+  Kanniyakumari, Thiruvananthapuram, Chennai, Tirunelveli, Nellore (Kanniyakumari 0.756 at
+  k=-1 against 0.572 at k=0). Re-dating IMD by one day moved every 2018 peak to k=-2 against
+  both references, so the test tracks dates rather than an artefact of rain persistence. Two
+  independent models agreeing rules out a timing bias in either. The merge now moves IMD's
+  dates back one day, reads IMD for the following year too (model 31 Dec is IMD's 1 Jan),
+  and `check_attribution` refuses to write any merge whose rainfall does not correlate best
+  with ERA5 at lag 0.
+- **Every `imd_merged_district_observations_india_*` file is one day out, and is now
+  refused.** They were written by the old join. Being gitignored, they exist only on local
+  disks (2016-2019).
+  `ingest_backfill.observation_file` raises on one unless an `imd_aligned_*` file for the
+  same year exists, rather than letting it keep winning file selection. Regenerate with
+  `python -m scripts.fetch_imd_district_rainfall --years <year>`, then delete the old file.
+  Any model trained on data ingested from an `imd_merged_*` file learned from rainfall
+  labels one day out, and its scores should not be compared with ones trained after this.
+- **A three-hour residual remains, deliberately.** Even with the day corrected, rain falling
+  05:30-08:30 IST is counted by IMD in the neighbouring model day. It is not corrected:
+  re-cutting the model day to start at 0300 UTC would match IMD exactly and push Day 10 out
+  to forecast hour 243, past the 240-hour end of the GEFSv12 reforecast, losing rainfall at
+  the longest lead. Because a bust is the 90th percentile of a variable's *own* error
+  distribution rather than a fixed millimetre count, a uniform inflation of error lifts the
+  threshold with it; what does not cancel is districts and seasons where an unusual share of
+  rain falls inside that window.
+- **How much the three-hour residual costs has not been measured.** ERA5 is hourly, so the
+  same bust labels can be built on the 00 UTC day and on the 03 UTC day and compared - a
+  single percentage of labels that differ, on real data, with no assumption about IMD
+  involved. Nobody has produced that number yet. Until someone does, the paragraph above is
+  an argument, not evidence.
+
+- **EMOS's ladder position is unstable - never carry it across runs.** This entry
+  first claimed EMOS "flips negative at district scale", generalised from a single
+  run. A second run at the same scale contradicted it, so the claim is now narrower:
+
+  | scored on | EMOS BSS | EMOS ROC-AUC | Sanket |
+  |---|---|---|---|
+  | Nov-Dec 2017, within-year, 337,950 events (`run_20260911T163128Z`) | **-0.0264** | 0.5973 | BSS 0.3713, AUC 0.8466 |
+  | all of 2019, cross-year, 2,400,930 events (`run_20260912T005532Z`) | **+0.0653** | 0.6431 | BSS 0.3288, AUC 0.8327 |
+
+  Negative in one, positive in the other, at the same district scale. The two tests
+  differ in *both* the split type and the year, so neither can be credited as the
+  cause - claiming either would repeat the very mistake this entry is correcting.
+  What is safe to say: EMOS moves between splits; the cheapest baseline (ensemble
+  spread alone) beat it on Brier in the first (BSS 0.0130); and Sanket's classifier
+  clears every baseline in both by a wide margin. Re-score the whole ladder per run.
+  Measured 2026-09-11 and 2026-09-12.
+
+- **A cycle too incomplete to publish is refused, not partially ingested.** A short
+  rainfall *sum* is roughly half the real accumulation, and rainfall drives most busts, so
+  publishing a thin cycle would be worse than publishing nothing.
+
+- **The 2017 store places eight districts wrongly, and five of them are absent.** Until
+  2026-09-11 the schema mapper did not recognise a `region_id` column, so district rows
+  were placed by coordinate. Five districts' representative points lie inside a
+  neighbour, and their rows were re-keyed onto it: Imphal East -> Senapati, Dadra and
+  Nagar Haveli -> Valsad, Nagaon -> Karbi Anglong, Phek -> Ukhrul, Sundargarh -> Sambalpur.
+  After dedupe, Karbi Anglong, Ukhrul and Sambalpur hold the neighbour's forecasts and
+  observations (Karbi Anglong read 29.19 °C against its own 27.76 °C on 2017-07-15), and
+  the five do not appear. The mapper is fixed; the 2017 rows stay wrong until those ten
+  districts are re-ingested, and any model trained before that saw 661 districts with
+  three mislabelled. Anything ingested after the fix - 2018 onward - is unaffected.
+- **Wind stops at day 5 and soil moisture at day 3, in every year.** The reforecast
+  archive does not carry those messages past 120 h and 72 h (`VAR_SPEC.max_lead_h` in the
+  fetch script). Measured identically in 2017 and 2018. Models see no wind features for
+  days 6-10 and no soil-moisture features for days 4-10; this is the source, not a gap in
+  the fetch.
+- **Soil moisture's holes are four sea-covered districts, and the bigger problem is the
+  cycles where they are *not* holes.** The counts recorded earlier were right - 2017 is 60
+  values short per cycle (four districts × 3 leads × 5 members) from 2017-11-16, 2018 is
+  6,240 short per lead. Resolved 2026-09-20: the four are the same in both years, and they
+  are **Nicobar Islands, Lakshadweep, Diu and Mumbai City** - islands and tiny coastal
+  districts whose overlapping 0.25° cells are sea. `soilw_bgrnd` is a land-surface field,
+  so there is nothing there to read. The missingness is correct.
+
+  What is not correct is the other half. Where those districts are *not* NaN they carry
+  **~98% volumetric soil moisture** (2017 before 2017-11-16: mean 97.89, min 91.1, max
+  100.0, n=19,140), against inland Nagpur's **20.61** over the same window. That is the
+  ocean being read as saturated ground rather than masked, and it enters the store as a
+  real measurement with a real `source_grib`.
+
+  Which behaviour you get depends on the year, not on the data - measured across every
+  sample file on disk, at lead ≤ 3:
+
+  | years | behaviour |
+  |---|---|
+  | 2010, 2011, 2014, 2015 | masked (NaN), no saturated values |
+  | 2012, 2013, 2016, 2019 | no NaN at all; saturated values passed through |
+  | 2017 | 19,560 saturated, 2,340 masked (masking starts 2017-11-16) |
+  | 2018 | 18,720 masked, 3,180 saturated |
+
+  A year-dependent split like that follows fetch vintage, not meteorology.
+
+  **In the canonical store this produces a guaranteed, fabricated bust label.** The two
+  products disagree diametrically over water, and the pipeline pairs them anyway
+  (measured 2026-09-20 over the whole store):
+
+  | | n | mean | median |
+  |---|---|---|---|
+  | forecast, the four | 22,740 | 97.88 | **99.78** |
+  | observed, the four | 1,475 | 1.72 | **0.00** |
+  | observed, other 662 districts | 242,155 | 27.78 | 25.99 |
+
+  GEFS reports sea as saturated ground; ERA5 reports it as empty. Pairing those gives:
+
+  | | paired rows | median abs error | over the 35.68 threshold |
+  |---|---|---|---|
+  | the four | 3,915 | **100.00** | **100.0%** |
+  | all other districts | 724,479 | 8.90 | 0.9% |
+
+  So those four districts are labelled a soil-moisture bust on **every single paired row**,
+  against a 0.9% rate everywhere else, and they hold 22,740 of the store's ~24,841
+  readings above 90%. Any model trained on this can learn "these districts always bust"
+  as a district-identity shortcut - worth noting that `region_id` ranks in the classifier's
+  top five SHAP features.
+
+  **It is not four districts, it is a gradient, and the cause is the weight table having
+  no land mask.** Ranking all 666 by median forecast soil moisture puts them in almost
+  exactly the order of how much sea each contains:
+
+  | district | median | | district | median |
+  |---|---|---|---|---|
+  | Nicobar Islands | 100.00 | | Mumbai Suburban | 55.54 |
+  | Lakshadweep | 100.00 | | Chennai | 54.13 |
+  | Mumbai City | 99.37 | | N & M Andaman | 52.43 |
+  | Diu | 91.50 | | Porbandar | 44.96 |
+  | Daman | 87.31 | | Kachchh | 42.24 |
+  | Mahe | 83.56 | | Gir Somnath | 41.74 |
+  | South Andaman | 77.55 | | **all 666 districts** | **14.79** |
+
+  Every one of those is coastal or island. The one exception in the top 15 is Lahul &
+  Spiti at 40.85 - high Himalaya, so presumably snow or ice rather than sea, a different
+  land-surface artifact of the same kind.
+
+  The district value is the area-weighted mean of every 0.25° cell the polygon overlaps.
+  That is the right rule for a field defined everywhere, and the wrong one for a
+  land-only field, because the sea cells are not missing - they carry a saturated ~100
+  sentinel. So each coastal district is pulled toward 100 in proportion to its sea
+  fraction, continuously, and the seven worst are simply the ones that are mostly water.
+  Three further districts beyond the four above - **Daman, Mahe, South Andaman** - carry
+  an 87.5% soil-moisture bust rate over 3,366 paired rows on the same mechanism.
+
+  That reframes the fix: not a per-district exclusion list, but a land mask applied to
+  the weight table for land-only variables, decided once. the engineering reference's "exactly one weight
+  table" still holds - the table needs a per-variable mask, not a second table.
+
+  **Measured 2026-09-20: this does not inflate the headline skill - it depresses it.**
+  Recomputed on run_20260910T064804Z's own eval events, held-out test split (n=18,700):
+
+  | | n | ROC-AUC | Brier | bust rate |
+  |---|---|---|---|---|
+  | with sea districts | 18,700 | 0.8411 | 0.1656 | 0.5059 |
+  | **without them** | 17,050 | **0.8550** | 0.1582 | 0.5147 |
+  | sea districts only | 1,650 | 0.7209 | 0.2416 | 0.4145 |
+
+  Removing them *raises* test AUC by 0.0139. The model is worse on those districts, not
+  better, so it is not exploiting a district-identity shortcut and the published 0.8411 is
+  conservative rather than flattering. The val split disagrees in direction (sea-only AUC
+  0.9072 against 0.8399 for the rest), which on 1,650 rows and three districts is the
+  expected instability, not a contradiction.
+
+  **Important limit on that reassurance.** Only **3 of the 7** affected districts appear in
+  this eval at all, and it covers **34 districts** total - the label-coverage limit of the
+  run. Soil moisture is 80% NaN for those three here against 70% elsewhere, so this run
+  largely *escaped* the contamination: it drew on years where the sea cells were masked.
+  A run trained on 2012, 2013, 2016 or 2019 - the years that pass the saturated value
+  through - has no such protection and has not been measured. So this clears run
+  run_20260910T064804Z, not the mechanism.
+
+  Rule 1 says every value must trace to a real GRIB2 message. These do, and that is the
+  point: the message is real and means "sea", and the pipeline records it as ground. Not
+  fixed here - fixing it means deciding the land-mask rule once and re-ingesting the
+  affected years, not patching the reader, and it should be one decision rather than four
+  districts' worth of special cases.
+
+  **Decided and implemented 2026-10-02 (feature version 2).**
+  - **Why a district list and not a cell mask.** The ideal fix, a land mask in the
+    weight table, would need the forecast side re-aggregated cell by cell. The archive
+    holds district means per member, and the grid bundles only the ensemble mean and
+    spread, so that means refetching GEFS (CONTRIBUTING.md rule 7).
+  - **The rule.** Soil moisture is dropped, on both sides, for a district whose weight
+    is more than 5% GEFS sea (`engineering.SOIL_SEA_FRACTION_MAX`).
+  - **The mask.** `data/geo/soil_land_mask.parquet`, built by
+    `scripts/build_soil_land_mask.py`. A GEFS sea cell is one at ≥ 0.9 in at least 95%
+    of the 730 valid 2017-2018 cycles; that gives 8,586 of the domain's 20,445 cells.
+  - **The 18 districts excluded:** Nicobar Islands, Lakshadweep, Diu, Mumbai City, Mahe,
+    Daman, South Andaman, Gir Somnath, Kachchh, Kasaragod, Ramanathapuram, North &
+    Middle Andaman, Udupi, Mumbai Suburban, Kannur, Junagadh, Dakshina Kannada,
+    Jagatsinghapur. Every other variable in them is kept.
+  - **Below 5%,** sea moves a district's GEFS soil by at most ~3.5 points, mostly
+    steadily, and the bias correction removes the steady part.
+  - **The observation side** needs no district rule: estimator-v2 observations average
+    ERA5 soil over cells ERA5's own mask calls at least half land.
+  - **Why ERA5 water is not a criterion.** Excluding on it too would have dropped 26 more
+    coastal districts (Kerala, Goa, the Odisha coast) whose GEFS cells are land.
+  - **This assumes v2 observations;** v1 averaged ERA5's water in as ~0.
+  - **Not covered:** Lahul & Spiti's high soil values (snow or ice) are not sea, and are
+    left to the bias correction.
+- **The parser test's collected count is not portable across machines.**
+  `tests/test_parsers.py` runs one test per real file `conftest.iter_sample_files()`
+  finds, which scans two roots: `backend/data/samples/` (repo, real fetch output) and,
+  if it exists, `~/Desktop/data` - a personal, non-repo folder specific to whichever
+  account is running the suite. On this Mac that adds 51 files no other machine, and no
+  CI runner, will ever have. Moving work to a second laptop (2026-09-11) also excluded
+  `backend/data/samples/parts-2018/` from the copy - 365 real per-day fetch parts,
+  deliberately left out of the transfer as redundant with the single assembled
+  `gefs_reforecast_india_2018.parquet` they already produced, but still counted by this
+  test's directory scan on the source machine. Net effect: the Mac collected 826 tests at
+  commit f36795a; the second laptop collected 384 at the same commit, and both are
+  correct for what each machine actually holds. Neither figure is "the" real count - use
+  pass/fail/skip ratios and diagnose any gap in the total before assuming a real problem.
+- **Observed soil moisture dips fractionally below zero in the two island districts.**
+  Nicobar Islands and Lakshadweep, and only those, carry negative values in the CDS
+  district observations: 400 of 243,090 district-days in 2017 and 364 in 2018. The most
+  negative are −0.00045 and −0.00049 percentage points. Both districts are almost all sea
+  at 0.25°, so their area-weighted soil moisture sits near zero and the negatives are
+  float-noise sized. The observation files keep them as delivered, unclipped; whether the
+  ingest preserves them has not been checked. A physical-range check that assumes ≥ 0 will
+  flag them. Measured 2026-09-11.
+
+### Forecast jumpiness (C1), added 2026-09-16
+
+- **The jumpiness features are empty on every row the served model trains on.** They
+  compare forecasts for the same valid date from different initialisations, and a cycle
+  only reaches 10 days ahead, so two cycles must be under 10 days apart to overlap. The
+  backfill archive (`backfill-2000-2019.tar.gz`) holds 17 cycles a year spaced 14-35 days
+  apart: 0 of 304 consecutive pairs across 2000-2018 are under 10 days, measured
+  2026-09-16. Until a daily or stride-2..9 year (e.g. `fetch-daily-year.yml`'s 2017) is in
+  the training store, `jump_*` carries no signal, XGBoost cannot split on it, and SHAP
+  attributes nothing to it. The code path is complete; the data is not there.
+- **Jumpiness does not cross a change of region scheme.** The live feed moved from
+  state-level IDs (`IN-AN`) to district IDs (`IN-AN-SOUTHANDAMAN`) on the 2026-09-09
+  cycle. A district's jump history therefore starts there: 2026-09-10 has two usable
+  cycles, and `jump_std` / `jump_sign_flips` (which need three) are NaN until 2026-09-11.
+  Deliberate - a state mean and a district mean are not the same forecast.
+- **The relative jump is per district and variable, not per lead.** Jumps grow with lead
+  (on the 2026-09-10 serving cycle the median |change| was 0.316 at Day 1 against 0.758 at
+  Day 2), so `jump_rel_climatology` mixes lead with unusualness. The model also sees
+  `lead_time_days` and can separate them; a per-lead climatology is the refinement if the
+  feature earns its place once daily data exists.
+- **Pooled training does not fit the jump climatology.** `full_retrain_pooled` (a
+  comparison tool that never promotes) leaves `jump_rel_climatology` NaN; the other three
+  jump features are cached and used. `full_retrain` fits it on the training split and
+  ships it as `jump_climatology.json`.
+- **Scoring an uncached cycle is slower.** Earlier cycles are read one at a time and
+  reduced to ensemble means as they are read, to keep resident memory at one cycle of
+  member rows. Measured on the serving store (71 regions, Windows, 3 runs each): peak
+  working set 327/347/348 MB before, 348/338/355 MB after - inside run-to-run noise - and
+  1.2 s -> 3.4 s per uncached cycle. Not yet measured at 666 districts on the Linux box;
+  `measure-serving-memory.yml` is the check that counts.
+- **Training frames carry four more float32 columns per member row.** On the real slice
+  `test_paired_frame_memory.py` builds, the downcast frame went from 2.84 MB to 3.2 MB
+  (+14%). Not yet measured at year scale, where the paired frame was 7.4 GB for 365
+  district cycles. That test's "at least a halving" assertion was already failing on
+  `develop` (5.59 -> 2.84 MB) and still fails (6.2 -> 3.2 MB).
+
+### Found while building C1, not caused by it
+
+- **`forecast_error_lag` is present in training and absent at serving.** It is the
+  previous lead's absolute error for the same cycle and member, which needs that lead's
+  observation. Measured 2026-09-16 on real cycles: non-null on 100% of lead 2-10 rows of a
+  training cycle (2016-04-10), and on 0% of rows at every lead when scoring the newest
+  cycle (2026-09-16), because those observations do not exist yet. The regressors learn
+  from a value serving never supplies. The same observation is also later than the
+  forecast's issue time, so held-out metrics may include information a live forecast could
+  not have had. Not fixed here: it changes served model behaviour and needs its own
+  before/after ladder.
+
+### Time-lagged ensemble (C2) and district descriptors (C4), added 2026-09-17
+
+- **The time-lagged ensemble inherits C1's sparse-density limitation exactly.**
+  `laf_pool_std` / `laf_spread_ratio` need an earlier cycle still valid for the same
+  target date, same overlap condition as `jump_std`. In the 17-cycle-a-year backfill
+  archive that is almost never true, so the pool usually collapses to this cycle's own
+  members (`laf_spread_ratio` = 1) - real, not a bug, and it activates on the same daily
+  or dense-stride data that unlocks C1.
+- **`border_distance_km` (C4) is distance to the modelled landmass's edge, not to the
+  coast.** It is built from the union of all 666 district polygons
+  (`scripts/build_district_descriptors.py`), which has no separate reference to tell
+  coastline from international land border (Pakistan, China, Nepal, Bhutan, Bangladesh,
+  Myanmar) apart. A district near the Bangladesh border and a coastal one at the same
+  distance get the same value. Fixing this needs a real coastline dataset this repo does
+  not have.
+- **The C2/C4 before/after ladder was measured on the small CI sample, not at district
+  scale.** `data/samples/gefs_reforecast_india_2019.parquet` covers 36 districts (one per
+  state) and 17 cycles - real data, but neither the volume nor the district density
+  region_id's replacement is meant to help with. Measured 2026-09-17, same 2019 sample,
+  identical train/val/test split: ROC-AUC 0.7440 -> 0.7426, Brier 0.2012 -> 0.2037, F1
+  0.6339 -> 0.6400 - inside noise for 1,050 test events, nowhere near the promotion
+  gate's 0.05 ROC-AUC regression bar. This confirms no regression, not a proven gain;
+  re-score once a district-grain, denser-cadence store is available.
+
+### C4 completed with elevation_mean, added 2026-09-18
+
+- **`elevation_mean` depends on a free, third-party public API this repo does not
+  control.** `scripts/fetch_grid_elevation.py` queries `api.open-elevation.com`, an
+  open-source, no-auth service whose own setup docs (fetched 2026-09-18) name its
+  dataset as the CGIAR-CSI SRTM 250m resampled product
+  (https://srtm.csi.cgiar.org) - not a NOAA/Copernicus source like everything else this
+  project fetches. If that service goes offline or changes its dataset, the cached
+  `data/geo/grid_elevation_m.parquet` (4,902 cells, fetched once) keeps working; a fresh
+  fetch would not until the service is back. Verified against three known points before
+  trusting it for all 4,902: Everest 8771 m (real ~8849 m), Mumbai 6 m, Delhi 214 m (real
+  ~216 m).
+- **250 m resolution, aggregated through a 0.25 deg (~28 km) weight table.** Elevation
+  is fetched at the same grid cells GEFS/ERA5 already use, then area-weighted per
+  district by the same `DistrictGridAggregator` - so `elevation_mean` is precise to the
+  0.25 deg cell, not to 250 m, for any district smaller than one cell. This matches every
+  other district-level value in this project (temperature, rainfall, etc. are the same
+  cell-level average), so it is consistent with the rest of the feature set, not a new
+  weakness specific to elevation.
+- **Re-scored on the same real 2019 CI sample as C2/C4's original ladder.** ROC-AUC
+  unchanged at 0.7426, Brier 0.2037 -> 0.2038, F1 0.6400 -> 0.6450 - within noise, as
+  expected for one more numeric feature on a 36-district sample. Same caveat as before:
+  confirms no regression, not a proven gain at district scale.
+
+### MJO (C3), added 2026-09-18
+
+- **This is NOAA PSL's OMI index, not BOM's canonical RMM index.** BOM's real-time text
+  file (http://www.bom.gov.au/climate/mjo/graphics/rmm.74toRealtime.txt) returns HTTP 403
+  - "The Bureau of Meteorology website does not support web scraping" - for any
+  automated request, verified 2026-09-18. `scripts/fetch_mjo_index.py` uses NOAA PSL's OMI
+  instead (real, no-auth, government-hosted, daily since 1991) and transforms it to the
+  RMM1/RMM2 convention per PSL's own documented mapping (RMM1 = OMI PC2, RMM2 = -OMI
+  PC1), correlation > 0.93 with BOM's RMM per PSL. Anyone comparing this project's
+  mjo_rmm1/mjo_rmm2 against a paper or plot that cites BOM's RMM directly should expect
+  small differences, not an exact match.
+- **No discrete MJO phase (1-8).** Phase-boundary conventions differ across sources and
+  could not be independently verified given BOM's access block, so only the continuous
+  mjo_rmm1/mjo_rmm2/mjo_amplitude are built. A model can still learn phase-like structure
+  from the continuous pair directly.
+- **MISO (the Indian-region monsoon analogue C3 was also named for) is not built.** No
+  verified public real-time source was found for it.
+- **The MJO index is global, not per-district**, and is attached by a backward as-of join
+  on init_date, tolerant of up to `MJO_ASOF_TOLERANCE_DAYS` (5) days of gap - a forecast
+  issued longer after the last known reading gets an unknown MJO state, not a stale one.
+  `scripts/fetch_mjo_index.py` is re-run in full each time (not idempotent like the geo
+  builds): the source is a small, continuously-growing daily file (~13,000 rows, under
+  1 MB as of 2026-09-18), not a multi-GB archive, so a full re-fetch is the simplest
+  correct way to pick up new days.
+- **`load_mjo_index` degrades to all-NaN, not a crash, when the cache file is absent** -
+  the same "the code path is complete; the data is not there" discipline as C1's
+  jump_* columns, so a fresh checkout that has not yet run the fetch script still trains,
+  just without this feature contributing anything.
+- **Measured on the same real 2019 CI sample.** Before C3 (with C1/C2/C4 complete):
+  ROC-AUC 0.7426, Brier 0.2038, F1 0.6450. After C3: ROC-AUC 0.7516, Brier 0.2010, F1
+  0.6681 - a small, real improvement in the same direction on every metric, though on
+  1,050 test events this is not distinguishable from noise on its own (the reported 95%
+  CI on ROC-AUC is roughly +-0.05 wide). Not proof C3 adds real skill; consistent with
+  it not hurting.
+- **No longer a model input, 2026-10-01.** OMI is not published in real time, so live
+  cycles never have it. See "The MJO file stops at 2026-06-24" in the 2026-09-25 audit
+  below.
+
+### Seventeen-year pooled training, added 2026-09-21
+
+- **The regressors fit on a sample of training days, not every day.** Pooled training
+  over 2000-2016 has 6,193 training cycles. Measured on the real caches for one
+  variable, XGBoost's `QuantileDMatrix` peaked at 17.32 GB of commit for one year and
+  26.11 GB for two (25.89 GB with 4 threads instead of 20, so thread count is not the
+  cause), while the parquet reader on its own stayed flat at ~8.6 GB. At that rate,
+  seventeen years at every-day density does not fit the training laptop's 83 GB commit
+  limit (24 GB RAM + 60 GB pagefile) on either the CPU or the GPU. Every variable that
+  tried it hit the limit: Windows logged a low-virtual-memory event at 60-62 GB, and the
+  variable was dropped. So each variable's regressor, and each of its OOF fold models,
+  fits on `MAX_FIT_CYCLES` = 2,000 cycles, drawn by a fixed-seed uniform sample across
+  all seventeen years and every season (`pooled_training.fit_cycles`). Every other step
+  still uses every cycle: bust thresholds, historical bust frequency, validation, the
+  held-out 2017 test year and the classifier's training events. Consecutive days are
+  strongly autocorrelated, so a third of the days carries much more than a third of the
+  information, but that has not been measured here. Comparing a 2,000-cycle fit with a
+  full-density fit needs a machine with roughly 100 GB of memory.
+- **Every variable now trains on CUDA when a GPU is present.** Before this, the variables
+  were split half GPU and half CPU so the two halves could run at the same time. That
+  concurrency was removed on 2026-09-17, but the split was left in, so half the
+  variables still went to the device with less headroom.
+- **Each finished variable is checkpointed** to `_pooled_cache/_variable_checkpoints/`,
+  keyed on the pool, the exact fit and validation cycles, and the XGBoost parameters.
+  After a crash in any later stage, a rerun reuses the finished variables instead of
+  retraining them.
+- **`laf_spread_ratio` was `inf` wherever this cycle's members agreed exactly while
+  earlier cycles did not.** Pool spread divided by an own spread of exactly zero. This is
+  common for dry-day rainfall, where every member says 0 mm (1.2-1.4 M rows per year),
+  and it also hit saturated humidity and soil moisture. XGBoost refuses `inf`, so
+  `humidity_pct` failed to train on 2026-09-21. The ratio is undefined there and is now
+  NaN, which XGBoost treats as missing. Every model trained before this fix saw `inf` in
+  this column for those rows. Cached years built before the fix are repaired in place
+  by `_ensure_finite_cache`: `inf` could only come from x/0 with x > 0, so the repaired
+  file is exactly what a rebuild would write. `inf` in any other float column is
+  refused, not rewritten.
+- **Staged mode (`--fit-mode staged`) fits on every training cycle.** The training
+  cycles are split into disjoint chunks of at most `MAX_FIT_CYCLES` (`fit_chunks`, a
+  fixed-seed shuffle, so each chunk spans every year, season and OOF fold). The chunks
+  are boosted one after another into the same booster, with `n_estimators` divided
+  between them, so peak memory is the same as sample mode. The result is still one
+  model per variable, so SHAP and serving are unchanged. The trade-off: trees from
+  earlier chunks are fit without ever seeing later chunks, and later trees only correct
+  what earlier trees left over on their own chunk, so this is not equivalent to one fit
+  on every cycle at once. Whether it beats sample mode is decided on the same held-out
+  2017 rows, not assumed.
+- **Classifier events are built one batch of forecast dates at a time**
+  (`EVENTS_BATCH_CYCLES` = 100), for training years and for the held-out year. On
+  2026-09-22 a whole 76.5M-row year in pandas peaked at 41.6 GB of commit, and the
+  2015 worker died on a 1.14 GiB allocation on both attempts, which ended the first
+  17-year run after all eight regressors had finished. Batched, real 2015 peaks at
+  14.3 GB. This is exact, not an approximation: `EVENT_KEYS` include `init_date`, and
+  a test compares the batched and whole-year frames on real data. Test-year metrics are
+  computed once per variable over every row, not averaged across batches.
+- **The classifier trains on events from the regressors' 2,000-cycle fit sample, not
+  from every training cycle.** At seventeen years, every training cycle's events come to
+  about 39 M rows (float64). With those in memory, the parent could not allocate 306 MB
+  to read the validation set back (2026-09-22). This applies in staged mode too. Event
+  frames are now float32, which is the precision XGBoost trains in anyway. Validation
+  events are built in their own worker, one batch of forecast dates at a time, and a
+  test on real data shows they equal the previous whole-frame output.
+
+### Serving a pooled model, added 2026-09-22
+
+- **CI cannot train the model the site serves.** Seventeen pooled years need a GPU, about
+  50 GB of memory headroom and more wall clock than a GitHub Actions job may take, so the
+  model is trained on the workstation and published as the `serving-model` release. The
+  refresh workflow installs it and skips its own training, while still pulling a fresh
+  GEFS cycle every six hours. Deleting that release returns the pipeline to training its
+  own model; `ignore_pinned_model` does the same for a single run.
+- **The refusal to promote used to stop the data refresh.** `train_pipeline` exits 1 when
+  the gate refuses a model, which skips packaging and publishing - so between 2026-09-19
+  and 2026-09-22 every scheduled run failed (CI models scoring ~0.67 against the served
+  0.80) and the site served three-day-old forecasts while looking healthy. With a model
+  pinned, the run no longer trains, so a refusal cannot block the data. The exit code
+  itself is unchanged for the unpinned path.
+- **A pooled run is not servable until it is finalized.** `full_retrain_pooled` did not
+  write `shap_summary.parquet` or the manifest's `shap_method`, which the region panel's
+  "what drove this prediction" reads, so a pooled model would have served no explanation
+  at all. `finalize_for_serving` writes them, rebuilding the validation events from the
+  caches in batches and refusing unless they reproduce the run's saved validation ROC-AUC.
+  It now runs at the end of every pooled run, and `--finalize RUN_ID` backfills one.
+- **The explanation summary grouped by index label, not by row.** `explain_model` built its
+  contribution frame on the caller's index and then looked each group up by label. Every
+  caller until now handed it a frame with unique labels, so it was right by luck; the
+  finalize path builds each regressor's sample one batch of forecast dates at a time, and
+  each batch carries its own `0..n` index, so the labels repeat. A label lookup then pulls
+  in every row sharing the label and each district's mean drifts toward the national one -
+  in a two-district reproduction with true means 0 and 10, both came back 5.0. Nothing
+  raises and the panel still renders, which is why this is written down rather than left as
+  obvious. Grouping is positional now, and a test asserts a repeated-index frame gives the
+  same answer as the same rows with unique labels. Models served before 2026-09-22 are
+  unaffected - their explanations were built in one frame, and the live panel still returns
+  different drivers per district.
+- **A model reloaded from the registry lost its categorical flag.** XGBoost's JSON
+  round-trip does not restore the sklearn wrapper's `enable_categorical`, so SHAP refused
+  a reloaded model ("Invalid columns: season: cat") and silently degraded to feature
+  importance. Restored on load; the SHAP values then equal the in-memory model's exactly.
+- **A pooled run's baseline ladder is a separate step, and a run that skips it silently
+  loses three Model-page cards.** `scripts/run_baselines` needs a `train` split, which the
+  pooled eval events do not carry: that split is 13,320,000 rows against the held-out
+  2,430,900, `_emit_eval_events` copies each split before concatenating, and the parent
+  process has already died on a 306 MB allocation at the end of a seventeen-hour run. So
+  the ladder's training rows are rebuilt separately -
+  `train_pooled.py --emit-baseline-fit <run_id>`, then `run_baselines --run-id <run_id>
+  --write-run-artifact`. **Run both, or `baselines.json` and `misses.json` are absent from
+  the run directory and the packaged artifact.** That is how `run_20260922T043925Z` went
+  live with the economic-value card, the "where it was wrong" card and the reliability
+  plot all rendering nothing: `EconomicValueCard` returns `null` when
+  `baselines.models` has no `is_model` row, so it vanishes without so much as an empty
+  state. The rebuild is cheap because the ladder reads no regressor output - see
+  `pooled_training.BASELINE_FIT_BASE_COLUMNS` - so no regressor runs: ~4 minutes and
+  1.08 GB for 2,000 cycles, measured 2026-09-23. Conformal `q_hat` is still `nan` for a
+  pooled run, because that needs a `val` split carrying `model_proba`, which does require
+  the regressors.
+- **Three things the pooled path dropped that the non-pooled path produces, found one at
+  a time by a person noticing.** Eval events (fixed), the baseline ladder and
+  `misses.json` (fixed here), and before either, the deck's figures. Each was found
+  because a deliverable was missing, not because anything failed. `full_retrain_pooled`
+  and `full_retrain` have no test asserting they produce the same set of run-directory
+  artifacts, and until they do, assume the next pooled run is missing something nobody has
+  looked for yet.
+- **`jump_rel_climatology` is always missing for pooled models.** The pooled cache builder
+  fits no jump climatology, so the column is entirely NaN in every cached year: the models
+  never learned from it, and serving leaves it missing too, which is consistent but means
+  one C1 feature is dead weight in this family.
+- **A model can pass the promotion gate and still serve one number for the whole country.**
+  `run_20260910T064804Z` held out at ROC-AUC 0.8411 and Brier 0.1656, with its held-out
+  probabilities spread evenly over the five calibration bins (11.3 / 23.2 / 16.5 / 20.9 /
+  28.1 per cent). It was promoted on those numbers and then served 642 of 666 districts in
+  the bust band, median served probability 0.977, 46.2% of events above 0.99. Both facts
+  are true at once because ROC-AUC is rank-based: it is invariant under any monotone
+  transform of the scores, so crushing every probability toward 1 leaves it untouched. The
+  held-out histogram missed it too, because the held-out rows were the 34 districts that
+  had observations when the model was trained, scored against the observation set that
+  existed then. The cause was not code drift - `git diff` on the feature module since the
+  training commit is 386 insertions and zero deletions - but that the store's observation
+  side was replaced underneath the model: it was fitted against 34-district city-point
+  ERA5 and is now asked to score 666-district ERA5-CDS. The data it learned from no longer
+  exists. `app/ml/serving_sanity.py` now scores a real cycle from the store after the
+  held-out gate has said yes, and refuses a run whose bust band swallows more than 60% of
+  events, whose probabilities pin against either rail for more than 10%, or whose
+  interquartile range collapses below 0.02. Note the two criteria that do **not** work and
+  should not be reintroduced: "too much of the map in one band" and "interquartile range
+  too narrow" both refuse the healthy 17-year model, which serves 90.4% in the `low` band
+  at an IQR of 0.119 - tighter than one of the broken runs. A quiet day is genuinely
+  quiet; what distinguishes damage is which rail the mass is pinned against.
+- **RESOLVED 2026-09-23 - the live feed was never migrated to districts; it sampled 36
+  city points.** Kept here because the reasoning about why the obvious fix was the wrong
+  one is still the record of how this was decided. What shipped: `app/live/gefs.py` now
+  calls `DistrictGridAggregator.prepare` / `aggregate_prepared` over the full subregion
+  the NOMADS fetch was already downloading, and `app/live/observations.py` fetches the
+  weight table's 4,902 cells from Open-Meteo in batches of 300 and aggregates them the
+  same way. `CITIES_JSON`, `load_cities` and `_extract_points` are gone from the module
+  rather than left dormant. Wind is aggregated as u/v components and converted to a
+  bearing last, because averaging 350 degrees and 10 degrees as scalars gives 180.
+  Measured against the live site the same day: `/api/regions/all` returns **666 distinct
+  `region_id`s on every one of the ten lead days**, matching the topojson ids exactly with
+  none missing in either direction, and the lead-1 band split is 434 low / 192 medium /
+  40 high - the saturated all-red map that prompted this is gone. The memory question
+  below turned out to be the binding one, not the row count.
+  The original entry follows.
+  docs/engineering-reference.md describes each district's value as the area-weighted mean of every 0.25 degree
+  cell its polygon overlaps. That is true of the archive/reforecast path. It is not true of
+  the live NOMADS path: `app/live/gefs.py` reads `scripts/india_cities.json`, which holds
+  **36 points**, samples the grid at each one, and resolves the point to whatever district
+  contains it. `grep -riE 'district|weight_table|area_weight' app/live/` returns nothing.
+  The published bundle shows the consequence - 1,520,552 rows, of which forecasts are
+  1,077,896 over **71 regions** and observations 442,656 over the same 71, with
+  `region_resolution_method` on every forecast row being a point resolver
+  (point_in_polygon 47, name 23, nearest_polygon 1). 71 is the union of districts those 36
+  points have fallen in over time.
+  This is worth stating precisely because the obvious fix is the wrong one. Packaging the
+  666-district ERA5-CDS observations into the bundle does **not** move the map: the
+  classifier needs a forecast row to score a district, and the forecast side would still be
+  36 points. The observations are not the narrow side - both sides are 71. The real fix is
+  to call the existing district weight table from `app/live/gefs.py` instead of sampling
+  points, which is a change to one call site and not new geography (there is exactly one
+  weight table and rule "do not write a second one" stands). It needs neither CDS nor the
+  17-year model.
+  It is not a change to make casually. Going from 71 to 666 regions multiplies served
+  forecast rows by ~9.4x - roughly 14 M rows for the same cycles - and serving already uses
+  388 MB of the 512 MB at which the box is killed rather than throttled. Rule 5 applies:
+  `.github/workflows/measure-serving-memory.yml` exists for this, and the honest sequence is
+  migrate on a branch, run that workflow, read the real RSS, then decide.
+  Meanwhile the model itself is not the limitation. Scored against a store that does have
+  full district observations, `run_20260922T043925Z` returns 6,660 events across 666
+  districts and all ten lead days.
+- **`measure-serving-memory.yml` reports headroom that a live site contradicts.** The
+  workflow ends with `headroom=$((512 - B))` where `B` is peak RSS on the runner. After the
+  districts migration it reported a **negative** headroom - about -283 MB - for a
+  configuration that was at that moment serving 666 districts on Render without being
+  killed. Both numbers are real; the subtraction is not meaningful. `B` is a high-water
+  mark taken over every endpoint hit back to back in one process on a 16 GB runner under
+  no memory pressure, so neither pymalloc nor glibc ever has a reason to return arenas to
+  the OS, and transient peaks from different endpoints accumulate into one figure that no
+  single moment of the process ever occupied. The container is killed on *instantaneous*
+  RSS, and under real pressure the allocator does release. So read `B` as a **comparison
+  between two branches measured the same way** - which is what the `published` vs
+  `backfilled` delta line is for, and that delta is trustworthy - and never as an absolute
+  verdict on whether something fits. Do not "fix" this by relaxing the 512 constant: the
+  limit is real, it is the measurement that does not transfer. Rule 5 still applies, it
+  just means the delta and a real deploy, not the headroom line.
+- **Replay can be asked for a cycle outside the window it precomputes.** `replay_service`
+  exposes `_MAX_CYCLES = 10`, and `package_for_deploy.precompute_cycles` scores exactly
+  that window into `data/analysis/scored_cycles` so the box reads an answer instead of
+  computing one (+125 MB to read, versus 1,406 MB to score - the difference between
+  fitting and dying). The two are tied together deliberately: the packaging step reads
+  `_MAX_CYCLES` rather than hardcoding 10. But nothing *refuses* a request for an older
+  init date. `inference.score_cycle` checks the precomputed directory first, misses, and
+  falls through to scoring from the store on the serving box - the exact 1,406 MB path the
+  precompute exists to avoid. It has not been seen in the wild because the UI only offers
+  cycles from the same window, so reaching it needs a hand-made API call. The honest fix
+  is for `score_cycle` to refuse a cycle it has no precomputed answer for when it is
+  running on the serving box, per rule 3 - refuse rather than patch - rather than to widen
+  the window, which just moves the edge and costs artifact size. Not yet done.
+
+### `forecast_error_lag` reads an observation from after the forecast was issued, added 2026-09-25
+
+- **What it is.** `engineering.build_training_frame` sets `forecast_error_lag` to the
+  realised `abs_error` at lead k−1 of the *same* forecast (a `shift(1)` within
+  region, init date, variable and member). Under `valid_date = init + (lead − 1)`, lead
+  k−1 verifies at `init + (k − 2)`. So for every lead ≥ 2, the feature uses an
+  observation of a day that has not happened when the forecast is issued. Lead 1 is NaN.
+- **Who uses it.** All eight regressors of the live pooled run
+  (run_20260922T043925Z, checked in each `*_regressor.json`) and of the earlier
+  run_20260912T005532Z. The classifier does not take it directly. It does take every
+  regressor's output (`pred_err_*`, the top SHAP factors), so the effect reaches the bust
+  probability through them.
+- **What it does to the numbers.** In training and in the held-out year, every row with a
+  prior lead has a real observed error in this column. On a live cycle, only leads whose
+  previous day has already been observed have one; the rest are NaN. Replay of a past
+  cycle has them all, except Replay's past events, which are scored with the column
+  blanked (see "Replay's past events"). So held-out regressor metrics, and replay of a
+  recent verified cycle, can look better than live scoring.
+- **Measured 2026-09-28.** The served run was scored twice on September 2017 (inits 09-19
+  to 09-28, 666 districts, 66,600 events per mode), a year it never trained on: once as
+  live, with the lag blanked, and once with the lag filled in, as in training.
+
+  | lead | real bust rate | predicted, live | predicted, lag filled |
+  |---|---|---|---|
+  | 1 | 0.371 | 0.399 | 0.399 |
+  | 5 | 0.490 | 0.385 | 0.550 |
+  | 10 | 0.495 | 0.313 | 0.555 |
+
+  ROC-AUC was 0.699 live and 0.797 with the lag filled. Day 1 was 0.840 in both, because
+  Day 1 never has a lag. In training the lag is missing only on Day 1, so the model learned
+  that a missing lag means a Day-1-sized error. Live it is missing at every lead, so the
+  bust probability falls with lead day while real busts do not. This is the main reason
+  the live map calms at longer leads; the weather and the archive's lead caps are the rest
+  ("The map can get calmer at longer lead days", near the top). The
+  served run's recorded test score, in its metrics.json, was measured with the lag filled
+  in.
+- **Not a leak:** `historical_bust_frequency_region_season`. It is computed from the
+  training split only (`train_pipeline.py`, `compute_historical_bust_frequency(tr)`) and
+  shipped with the run, like a climatology.
+- **The fix is a retrain, not a serve-time patch.** Dropping or NaN-filling the column
+  in front of a model trained with it only changes what the served model sees. It does
+  not remove what the model learned. An attempted serve-time NaN-fill (2026-09-25) was
+  parked on `parked/opencode-nemotron` for that reason.
+- **Removed from training, 2026-09-29.** The regressors no longer take it
+  (`regressors.NUMERIC_FEATURES`), and `regressors.feature_columns` refuses any input in
+  `contracts.OBSERVATION_DERIVED`, so a later feature cannot bring it back
+  (`tests/test_no_observation_inputs.py`). The engineered frame still carries the column,
+  because the served run was trained with it and scores with its own saved feature list.
+  It can go when a run trained without it is served.
+- **Promotion compares like with like (decided 2026-09-29).** A run trained without the lag
+  would be refused by the 0.05 gate against the served run's lag-filled test score.
+  Instead, the served run is scored on the new run's test year as of issue time, and the
+  gate compares against that. The gate's code and thresholds are unchanged:
+
+      python -m scripts.score_run_on_year --run-id run_20260922T043925Z --year 2017
+      python -m scripts.score_run_on_year --run-id run_20260922T043925Z --year 2017 --as-of-issue
+      python -m scripts.publish_serving_model --run-id <new run> --dry-run \
+          --incumbent-score data/analysis/cross_year_scores/run_20260922T043925Z_on_2017_as_of_issue.parquet
+
+  The first command should reproduce the served run's recorded test score. That checks the
+  method before the second is trusted.
+- **That check cannot pass, and the comparison was not like for like - corrected
+  2026-10-02.**
+  - The served run's recorded 0.8435 was measured against the one-day-late IMD rainfall
+    in its 2017 cache, while `score_run_on_year` reads the store's ERA5 rainfall.
+  - Each run was scored on its own events against its own thresholds, and nothing checked
+    that the events or labels matched.
+  - With bias-corrected busts (label version 2) the labels differ by design.
+  - So for a label-version-2 run, `scripts.score_shared_events` scores both runs as of
+    issue on the same year, joins them on the event keys (refusing duplicates or any
+    new-run event without an incumbent probability) and keeps the new run's label for
+    both.
+  - `publish_serving_model --shared-events` takes both metrics from that one file and
+    refuses it if the new run's score there differs from its recorded test score by more
+    than 0.002. The unchanged `_promotion_decision` then decides on them.
+  - `--incumbent-score` is refused for label version 2.
+  - `--incumbent-reference` checks, within 1e-5, that the served run is scored exactly as
+    the `pre-overhaul` code scored it:
+
+        python -m scripts.score_shared_events --new-run <new run> --incumbent run_20260922T043925Z \
+            --year 2017 --incumbent-reference <pre-overhaul score_run_on_year --as-of-issue output>
+        python -m scripts.publish_serving_model --run-id <new run> --dry-run \
+            --shared-events data/analysis/shared_events/<new run>_vs_run_20260922T043925Z_on_2017.parquet
+
+### Found in the 2026-09-25 audit (each re-checked against data, not only read in code)
+
+- **Most busts in temperature, humidity and soil moisture are steady per-district bias.**
+  - Measured on the serving bundle (85 cycles, 71 districts with observations): the
+    ensemble-mean error barely grows from Day 1 to Day 10 for temperature and humidity.
+  - A fixed per-district/variable/lead bias is 64% of squared error for both, and 90% for
+    soil moisture. Rainfall is 6%, and its error grows with lead as a forecast failure
+    should.
+  - The live run's lead/bust correlation is ~0.02.
+  - Removing each district's bias leave-one-cycle-out (no in-sample fitting) lowers Day-1
+    event busts from 0.31 to 0.25 and raises Day 10 to 0.50.
+  - Consequence: a "bust" today is often "this district is always off", which NCMRWF's
+    own bias correction removes.
+  - Decided: the next retrain defines busts on bias-corrected error.
+  - **Implemented 2026-10-02 as label version 2** (`contracts.LABEL_VERSION`,
+    `app/features/bias.py`):
+    - **The table.** The training-period mean error of the ensemble mean per (district,
+      variable, lead, month of the valid date), from training cycles only - monthly, not
+      seasonal, since 2026-10-05: leave-one-year-out over 2000-2019 left less error for
+      every variable (humidity 54.4 against 66.8 (%RH)^2; scripts/diagnose_label_drift.py).
+      A cell with fewer than 30 events backs off to the district's month across leads,
+      then to its whole year.
+      A key thin at every level has no bias: its forecast is not compared, never
+      compared raw.
+    - **Where it applies.** It is subtracted from each member forecast wherever a
+      forecast meets its observation: the regressor target, the event label, the
+      thresholds and the out-of-fold models, in both trainers, and in live scoring and
+      `score_run_on_year` for runs that carry `bias_table.parquet`.
+    - **What a run reads.** The corrected forecast and the bias removed
+      (`bias_correction`).
+    - **What the label covers.** Wind direction is no longer a label variable, and
+      events with no corrected error for any label variable are dropped rather than
+      counted as "not a bust".
+    - **On the CI sample** (12 training cycles), the corrected humidity bust threshold
+      is 13.1 %RH; on real Nov 2017 a per-district-lead correction gave 10.4 against
+      27.6 raw.
+    - **The served run_20260922T043925Z** has no bias table, so it keeps label version 1
+      and is scored exactly as before until a retrained run replaces it.
+- **The event bust rate (~49% on the test year) changes meaning with lead.** An event busts
+  if any available variable passes its own p90, and fewer variables exist from Day 4 and
+  Day 6 (see the next item). So the rate steps down exactly there. That confounds the
+  "lead day alone has no skill" argument. Per-variable bust heads are planned, rainfall
+  first.
+- **Variables served beyond the training archive's leads. Code fixed 2026-09-25 (PR #36); reaches the map only for cycle dates first scored after it (see the precompute entry below).**
+  - The reforecast archive holds 10 m wind only to 120 h and soil moisture only to 72 h.
+  - Live GEFS serves all ten days, and the map named wind the driver of 1,216 and soil
+    moisture of 167 district-days beyond those leads.
+  - `contracts.ARCHIVE_MAX_LEAD_DAYS` and `engineering.drop_beyond_archive_leads` now
+    remove those rows wherever features are read.
+  - Re-scoring the 2026-09-24 cycle: Days 1–3 unchanged, Days 6–10 mean |ΔP| ≈ 0.10.
+  - The reforecast's soil-moisture error is also about twice the live feed's at the same
+    leads (15.4 vs 8.7 points MAE). So its p90 does not transfer to live either.
+- **The live run's 2016/2017 rainfall truth is IMD-merged, not ERA5. The store is fixed
+  (2026-09-26); the live run and two training caches are not.**
+  - `metadata.db` shows `imd_merged_district_observations_india_2016/2017.parquet`
+    ingested 2026-09-12 19:35, after the ERA5 CDS files. The store keeps the latest row,
+    so IMD won.
+  - The same IMD files are documented above as one day late.
+  - So validation and test rainfall were scored against a different, shifted truth from
+    the one the model trained on.
+  - It was all four years, not two. `imd_merged_…_2018/2019` also came after ERA5, with
+    the same `source_column` (`precip_mm`) and `verification_status` (`final`), so they won
+    the dedupe too. Their rainfall differed from ERA5 in 72.5% (2018) and 79.8% (2019) of
+    rows; the other seven variables were identical copies.
+  - 2026-09-26: the four batches and their source files were moved (not deleted) to
+    `backend/data/canonical_backup_imd_merged_20260926/` on the training laptop. Their
+    `upload_batch` rows are `status = 'quarantined'`, with a note. Read back through
+    `parquet_store.read_dataset`, observed rainfall for 2016-2019 now comes only from the
+    `era5_cds_*` batches (243,756 / 243,090 / 243,090 / 243,090 rows). `MOVED.md` in that
+    folder says how to restore them.
+  - Still built from the IMD rows: `_pooled_cache/paired_2016.parquet` and
+    `paired_2017.parquet`, which predate the move. The serving bundle never held these
+    batches (0 IMD batches in its `metadata.db`), so the live site is unaffected.
+  - Still open: caching a year does not yet refuse stale IMD batches by itself.
+  - **Closed 2026-10-02.** The quarantine is now enforced, not only recorded:
+    `parquet_store.assert_no_excluded_batches()` refuses to build any training or
+    scoring frame while a batch whose `upload_batch.status` is `quarantined` or
+    `retired` has files in the store. Restoring the IMD files per `MOVED.md` would now
+    stop training rather than silently win the dedupe. And each cached year records the
+    store batches that reach it (`parquet_store.year_batch_signature`: id, rows, bytes),
+    so `cache_year` rebuilds a year when they change. A cache written before this has no
+    record and is rebuilt; a batch for another year leaves it alone.
+- **`forecast_error_lag` leaks** (entry above, added the same day). The classifier does not
+  take it directly, but takes every regressor's output, so held-out scores are inflated by
+  an unknown amount until the retrain.
+- **The MJO file stops at 2026-06-24.**
+  - `data/mjo_omi_index.parquet` was committed once and nothing refreshes it. Refreshing
+    would not help: NOAA PSL's own `omi.1x.txt` also ended on 2026-06-24 when fetched on
+    2026-10-01.
+  - The as-of join tolerates 5 days, so every live cycle gets NaN MJO features that
+    training always had.
+  - OMI may also be computed with future data. NOAA PSL publishes a real-time version
+    (ROMI) for this use.
+  - **Dropped from training, 2026-10-01.** New runs take none of `mjo_rmm1`, `mjo_rmm2`
+    or `mjo_amplitude`, in the regressors (`regressors.NUMERIC_FEATURES`) or the
+    classifier (`pivot.classifier_feature_columns`), and `tests/test_mjo_index.py` checks
+    both. The frames still carry the columns, because the served run_20260922T043925Z
+    was trained with them and scores with its own saved feature lists. They can go when
+    a run trained without them is served. ROMI, refreshed in CI, is the way to bring MJO
+    back.
+  - **The served run leans on them very little.** Their share of its mean |SHAP|, over
+    all districts and leads in its `shap_summary.parquet` (read 2026-10-01), is 0.0% for
+    the classifier and 0.1-1.1% for each regressor.
+  - **The gate's comparison still fills them in.** `score_run_on_year --as-of-issue`
+    blanks only inputs in `contracts.OBSERVATION_DERIVED`, so it scores the served run on
+    2017 with MJO filled in, while live it is NaN. With the weight above the difference
+    should be small, but it has not been measured.
+- **Wind-direction error is not circular.**
+  - `engineering.py` takes a plain difference and `pivot.py` a plain mean of directions.
+    Its p90 is ~189° raw against ~98° wrapped.
+  - A northerly is a bust by construction.
+  - Next retrain: circular error and circular mean (a helper exists on the parked
+    `parked/opencode-nemotron` branch), and drop wind direction as a bust label.
+  - **Measured 2026-10-02 (Nov 2017, 93,240 events):** 86.5% of direction busts under
+    the plain arithmetic disappear with a circular mean and circular error. The median
+    daily resultant wind is 1.39 m/s, and in 80% of events the forecast or the observed
+    wind is under 2 m/s, where a daily direction is mostly noise.
+  - **Fixed for new runs, 2026-10-02: feature version 2** (`contracts.FEATURE_VERSION`).
+    `abs_error` goes the short way round, `ensemble_spread` is the circular standard
+    deviation of the members, and the time-lagged ensemble pools unit vectors. A run is
+    scored with the version in its manifest; the served run has none, so it keeps
+    version 1 (the old arithmetic) and receives exactly the inputs it was trained on.
+    On the real CI sample, version 1 reproduces `main`'s frame exactly (186,660 rows,
+    56 columns), and version 2 changes only wind-direction rows. Their error p90 falls
+    from 191.0° to 115.1°, and spread p90 from 118.0° to 55.0°. A cached year records its
+    version and is rebuilt on a mismatch. Removing direction from the bust label is a
+    separate change (the bias-corrected label).
+- **Bust probabilities were not calibrated, and the classifier's early stopping never
+  fired. Fixed 2026-10-04 for new runs.**
+  - The served run trained with `scale_pos_weight = neg/pos` and was never recalibrated.
+    That weighting pushes every probability up: as recorded in that run's
+    `metrics.json`, its lowest reliability bin predicted 0.158 against ~0.07 observed
+    on test.
+  - Its `best_iteration` was 399 of a 400-tree cap, so early stopping never stopped it.
+  - New runs drop the weighting, allow 3,000 trees with early stopping of 100 rounds on
+    validation, and fit Platt scaling on validation (`app/ml/calibration.py`, saved as
+    the run's `calibrator.json`). A fit whose slope is not positive is refused.
+  - **What it does not change.** Platt is monotone, so rankings and ROC-AUC, the number
+    the gate reads, are unchanged.
+  - **SHAP is on the uncalibrated margin.** Calibration multiplies that margin by `a` and
+    adds `b`, so the order and relative size of the contributions are the same, but they
+    sum to the classifier's raw log-odds, not to the calibrated probability's.
+  - **Validation is used three ways** (early stopping, calibration, and later tuning), so
+    validation scores are optimistic. Test is never used for any of them.
+  - The served run has no calibrator and is scored exactly as before.
+- **The serving box was at 509 MB of 512. Guarded 2026-09-25.**
+  - Replay and the ensemble endpoint accepted any `init_date` and scored non-precomputed
+    cycles on the box (1,406 MB peak).
+  - `POST /api/upload` wrote into the served store.
+  - `SERVING_READ_ONLY` (Dockerfile) now answers both with a 409.
+  - The box's steady 509 MB is itself unexplained and should be measured and cut.
+- **Smaller, still open:**
+  - The collapsed-probability check (`serving_sanity`) runs in `full_retrain` but not in
+    `publish_serving_model`, the path that shipped the live model.
+  - A partial observation pull is marked complete (`orchestrator.py`, contrary to rule 3).
+  - 00/06/12/18Z cycles collapse into one date in the store, because the store keeps no
+    cycle hour.
+  - Relative humidity is derived from mean specific humidity/temperature/pressure in
+    training but taken as GEFS RH live.
+  - The SHAP panel is a validation-year profile per district, not a per-prediction
+    explanation (the panel now says so).
+  - `scripts/ppt_figures.py` defaults to `current.json`, which on the training laptop
+    points to an older run than the live one. Pass `--run-id`, or read `/api/model/status`.
+
+- **CI precompute never re-scores a date it has already scored.**
+  - `package_for_deploy._score_and_write` calls `inference.score_cycle`, which reads back
+    an existing `(run_id, init_date)` artifact before scoring anything. The refresh
+    workflow restores the previous release, artifacts included, so an already-scored date
+    is read back and written out unchanged.
+  - Found live on 2026-09-24 after PR #36 deployed. The API change was live (the panel
+    reported `max_lead_day`), but the 2026-09-24 map was byte-for-byte the old answer: 1,216
+    wind-driven district-days on Days 6–10.
+  - A scoring-code change therefore reaches only dates scored after it.
+  - The same reuse pins each date to the first cycle scored that day. Later 06/12/18Z
+    pulls update the store but not the map. That currently hides the four-cycles-into-one
+    collapse (entry above), because the map mostly shows the first, usually 00Z, cycle of
+    a date.
+  - Fix: a `use_precomputed=False` path for the precompute. Land it together with 00Z-only
+    ingest, so forcing a re-score does not expose the collapse.
+
+### The two sides of the label reduce humidity and wind differently, added 2026-10-02
+
+- **What differs.** The forecast side averages q, T, surface pressure, u and v over the day
+  (the eight 3-hourly instants of day k) and over the district, and only then derives RH,
+  wind speed and direction (`fetch_gefs_reforecast_sample.py`, `pull_one_file` then
+  `_canonicalise`). The archive's observations (`fetch_era5_cds_district_observations.py`
+  `to_daily`, "v1") derive RH every hour and wind speed in every cell, over all 24 hours,
+  and the district mean then averages those. RH and speed are non-linear, so the order
+  changes the number.
+- **Measured on Nov 2017** (cached CDS download, 666 districts, 19,980 district-days),
+  the forecast side's method applied to ERA5 minus v1:
+  - rainfall 0.00000 mm (identical: both sum the same 24 hourly accumulations);
+  - temperature +0.111 °C mean, from sampling 8 instants instead of 24;
+  - RH -2.28 %RH mean, down to about -4 %RH per district in the Bihar and UP plains, where
+    November's diurnal range is large. Mixing cells of different temperature explains
+    almost none of it (-6%); it is the time averaging;
+  - wind speed -0.034 m/s mean.
+  - In the same month, v1's RH offset flipped 4.4% of humidity bust labels, or about 1.7%
+    after removing a per-district, per-lead mean error.
+- **Fix in progress.** `--estimator v2` writes per-cell daily components
+  (`_era5_cds_v2/cells_daily_YYYYMM.parquet`: q, T, sp, msl, u, v, tcwv, swvl1 at the
+  forecast's instants, rain over 24 h). The district step derives RH and wind after the
+  mean, with the same functions as the forecast side (`app/utils/humidity.py`). The
+  2000-2019 observations are to be refetched this way before the next retrain. Until
+  then, the archive and the served model use v1.
+- **v1 soil moisture over water is a fabricated zero.**
+  - ERA5 has no soil over water, and `swvl1` reads ~0 there. v1 averaged those cells in
+    as real values, so Nicobar Islands and Lakshadweep had an observed soil moisture of
+    0.0% on every day of Nov 2017. Every soil "bust" there was guaranteed.
+  - v2 (`to_districts_v2`) uses only cells that ERA5's own land-sea mask calls at least
+    half land (`--land-sea-mask`). A district with no such cell gets NaN, not 0.
+  - Nov 2017, v1 → v2: Nicobar 0.0 → NaN, Lakshadweep 0.0 → NaN, South Andaman 1.7 →
+    30.8%, Mumbai City 0.2 → 9.9%.
+  - The forecast side still averages GEFS's sea cells, which read ~100%. The soil land
+    mask removes those districts' soil from both sides.
+
+### Replay's past events, added 2026-09-26
+
+- **What they are.** Replay lists four cycles from the reforecast archive above its recent
+  live cycles, and opens on the first. Each is a whole 666-district, ten-day cycle where
+  the rain forecast over one district went badly wrong. The catalogue is
+  `backend/app/services/replay_cases.py`; the artifacts are built by
+  `scripts/build_replay_cases.py` into the run directory that scored them
+  (`data/models/<run_id>/replay_cases/`), so they ship with that model and no other.
+  - Kerala floods, cycle 2018-08-13, Idukki, peak 15 Aug.
+  - Mumbai rain, cycle 2017-08-27, Mumbai Suburban, peak 29 Aug.
+  - Cyclone Ockhi, cycle 2017-11-28, Kanniyakumari, peak 30 Nov.
+  - Cyclone Fani, cycle 2019-05-01, Khordha, peak 3 May.
+- **How they were chosen.** By what happened, before any of them was scored, and each is
+  shown whatever the model said. A miss stays in. None is from a year the model trained
+  on: the builder reads the run's own `manifest.json` and refuses a training year. Each
+  case says which kind of unseen year it is. For run_20260922T043925Z, 2017 is the
+  held-out test year, and 2018 and 2019 were never used at all.
+- **Why three famous events are absent.** Replay checks the forecast against ERA5, and
+  ERA5 barely records these. Measured on the store's ERA5 district series while choosing
+  the events:
+  - Chennai, December 2015: 57 mm in ERA5, against roughly 490 mm measured on the ground.
+  - Mumbai, 26 July 2005: 74 mm in ERA5, against 944 mm measured.
+  - Patna, September 2019: 79 mm in ERA5, only the 37th wettest district that day.
+
+  Against that truth these would read as good forecasts. They can be added once IMD gauge
+  rainfall is the truth (docs/engineering-reference.md, Known limitations: "ERA5 precipitation is weak over
+  India").
+- **Scored as of 00 UTC on the init date.** `score_cycle(..., as_of_init=True)` blanks
+  `forecast_error_lag`, the one input built from observations after the forecast was
+  issued. Every live cycle is scored with that column mostly empty, so this is the state
+  the model is in when it is used. The observed values are kept, because they are what
+  the chart checks the forecast against.
+  - **This is not the leak fix.** The model still learned from the column in training (the
+    `forecast_error_lag` entry above), and that needs a retrain, not a serve-time blank.
+    What the blank does is stop a past event looking better than the same forecast would
+    have looked on the day.
+- **The checks a case must pass.** The builder refuses a case unless:
+  - all 666 districts are scored on every one of lead days 1-10;
+  - its year is not a training year;
+  - ERA5 has the case's variable over its district on its peak day.
+- **A new model needs its cases rebuilt.** The cases live in the run directory of the
+  model that scored them, so publishing a different run without them quietly drops Replay
+  back to live cycles only. That is by design: a case must never be served by a model
+  that did not score it. Before publishing a new run, run
+  `python -m scripts.build_replay_cases --run-id <run_id>` (about a minute per case, on
+  the workstation). The serving check then confirms the cases serve. A CI-trained run
+  has no cases.
+- **What the numbers are.** Everything Replay shows for an event is read from its
+  artifact. The only hand-written text is the four titles. No score for any event is
+  written in this file or in source; the builder prints them, and the site serves them.
+
+### Live observations and live humidity, made the training estimator, added 2026-10-04
+
+- **The live "ERA5" was not ERA5.** The archive request had no `models=era5`, so
+  Open-Meteo answered from its default model mix on a finer grid. Measured 2026-10-04:
+  19.0 N 72.75 E came back from 19.016 N 72.781 E, at 01 UTC on 2026-09-20 with 2 m
+  temperature 24.7 C and column water vapour 55.7 kg/m2, where ERA5's own cell reads 26.6 C
+  and 45.0. With `models=era5` the answer is ERA5's 0.25 deg cell, at exactly the
+  coordinates asked; `elevation=nan` stops Open-Meteo shifting temperature to its 90 m terrain model.
+- **The day and the estimator differed from training.** The live day was the 00-23 UTC
+  stamps; Open-Meteo stamps rain at the end of its hour, so 00 UTC rain fell the day
+  before. RH and wind were means of per-cell hourly values. The live fetch now builds the
+  CDS fetch's per-cell components (q from the dewpoint and surface pressure, the eight
+  3-hourly instants 03-24 UTC, rain summed 01-24 UTC) and goes through
+  `district_observations.to_districts_v2`, with ERA5's land-sea mask (now in `data/geo`).
+- **How close it now is.** One day, 2017-11-15, 653 districts, live path against the CDS
+  estimator (live minus CDS): temperature +0.024 C on average (0.048 at most), RH within
+  0.09 %RH at the 99th percentile, MSLP, wind speed, soil and column water vapour within
+  0.03 at most; wind direction within 1.8 deg at the 99th percentile.
+- **Rain reads slightly low through Open-Meteo.** It rounds hourly rain to 0.1 mm, and drizzle
+  under 0.05 mm/h rounds to zero: -0.09 mm/day on average that day, -0.8 mm in Mahe
+  (1.4 mm by CDS). Not fixable through this API; ERA5T from CDS would be.
+- **Surface pressure is not reported live.** Open-Meteo's `surface_pressure` is its MSLP
+  reduced to its own terrain height: inverting the barometric formula gives back the
+  `elevation` in each response to within a metre. Against ERA5's `sp` it read +0.2 hPa
+  at 395 m, +0.8 at 629 m, +2.0 at 1,743 m and +4.3 at 4,835 m. Missing, not wrong:
+  the live store has no surface-pressure observations, so that variable cannot bust
+  live. It still converts the dewpoint to q, where 1 hPa moves q by about 0.1%.
+- **Lost batches made partial districts, and the run said complete.** The aggregator
+  renormalises around missing cells, which is right for soil over sea and wrong for a
+  gap. `refresh-data.yml` on 2026-10-04 06:11Z lost 5 of 17 batches to HTTP 429 (the
+  per-minute limit; Open-Meteo counts each location as a call) and recorded the run
+  `complete`. Now a district touching a missing cell has no value for that variable, a
+  minute's 429 is waited out, an hourly or daily one fails the batch at once, and a run
+  with lost batches is recorded `partial`.
+- **Live GEFS RH was a different estimator.** The reforecast has no 2 m RH: its RH is
+  derived from the district and daily means of q, T and p. The live 0.25 deg file has RH
+  and no SPFH at 2 m (`gefs.20261002` `.idx`: SPFH at 2 m is only in the 0.5 deg
+  b-file), and the live code averaged GEFS's RH. It now recovers each cell's q from RH,
+  T and p (the exact inverse of the Bolton formula), then derives RH as the reforecast
+  does. Checked on 3,720 points where the two grids coincide: Bolton RH from GEFS's own
+  SPFH minus GEFS's RH product averaged +0.04 %RH (-0.4 to -0.7 below 0 C, where GEFS
+  uses ice). On a real Day 1 (gefs.20261002 00Z, gep01, 666 districts) the new RH is
+  0.69 %RH below the old on average (5th-95th percentile -1.8 to +0.3).
+- **Live MSLP is the same quantity as the reforecast's.** The reforecast labels its field
+  `PRES:mean sea level`; the live file carries both `PRMSL` and `MSLET`, which differ by
+  about 3 hPa over India, and the live code reads `PRMSL`. Checked against ERA5 `msl`
+  (Day-1 means of the eight 3-hourly instants): the reforecast in 2017 (387,258 cell-days)
+  read -0.2 to -0.4 hPa below 1,000 m; live `PRMSL` on gefs.20260926 00Z (gec00 and gep01,
+  60 cells spread by height) read -0.05 to -0.39 there, while `MSLET` drifted with height:
+  -1.0 to -1.2 at 300-1,000 m, -3.3 at 1-2 km, -13 above 2 km. `PRMSL` stays. One live
+  day and 60 cells; a larger check would need more ERA5 days than Open-Meteo's free
+  allowance gives in an hour.

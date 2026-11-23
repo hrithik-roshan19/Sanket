@@ -1,0 +1,161 @@
+"""Test fixtures.
+
+The metadata DB and the canonical parquet store are redirected to a throwaway temp
+directory *before* any ``app`` module is imported, by setting the same env vars the
+production config reads. Every test then gets a clean store via the ``fresh_store``
+fixture.
+
+Sample data: tests assert against the real files. ``SAMPLE_DIR`` resolves to
+``$FORECASTGUARD_SAMPLE_DIR`` -> ``~/Desktop/data`` -> ``backend/data/samples``. The two
+generated samples (GEFS reforecast + ERA5) always live in ``backend/data/samples`` and
+have their own path constants.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import tempfile
+from pathlib import Path
+
+import pytest
+
+# Windows only, load-bearing: import torch before pandas, anywhere in the process, or a
+# *later* torch.onnx.export() fails with "DLL load failed while importing
+# onnx_cpp2py_export: A dynamic link library (DLL) initialization routine failed" - a
+# generic Windows message that gives no hint it's an import-order issue. Reproduced with
+# a 2-import, no-pytest script: `import pandas; import torch; torch.onnx.export(...)`
+# fails every time; swapping the first two lines makes it pass every time. Not
+# Smart-App-Control, not a protobuf pin, not pytest - torch and pandas/numpy each bundle
+# their own OpenMP/MKL runtime, and whichever loads first wins the process; onnx's
+# compiled extension only surfaces the conflict later, at its own DllMain. Below,
+# `_ensure_sample_csvs()` imports pandas before any test module gets a chance to import
+# torch first, so this has to happen here, before that call, not in app/ml/cnn.py.
+# Harmless where torch is absent (the training extra) or on a platform where load order
+# never mattered. Measured 2026-09-11 on the RTX 4060 Windows box.
+try:
+    import torch  # noqa: F401
+except ImportError:
+    pass
+
+_TMP = Path(tempfile.mkdtemp(prefix="forecastguard-test-"))
+os.environ.setdefault("DATA_DIR", str(_TMP))
+os.environ["DB_PATH"] = str(_TMP / "metadata.db")
+os.environ["CANONICAL_DIR"] = str(_TMP / "canonical")
+os.environ["RAW_UPLOAD_DIR"] = str(_TMP / "raw_uploads")
+# MODEL_DIR must be redirected too: the API tests wipe the model directory between
+# cases, and without this they would delete the developer's real trained runs under
+# backend/data/models/.
+os.environ["MODEL_DIR"] = str(_TMP / "models")
+# Tests train against a throwaway store; the guard in full_retrain defaults to off.
+os.environ["ALLOW_LOCAL_RETRAIN"] = "true"
+
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+GENERATED_SAMPLES = BACKEND_DIR / "data" / "samples"
+GEFS_CSV = GENERATED_SAMPLES / "gefs_reforecast_india_2019.csv"
+ERA5_CSV = GENERATED_SAMPLES / "era5_observations_india_2019.csv"
+
+
+def _ensure_sample_csvs() -> None:
+    """Only the compact ``.parquet`` samples are committed (the ``.csv`` twins are
+    gitignored - the .gitignore note calls the parquet the source of truth). The tests
+    still read CSV, so on a fresh clone / CI they would fail on a missing file.
+    Materialise each CSV from its parquet once, here, rather than committing a 29 MB file.
+    """
+    import pandas as pd
+
+    for csv_path in (GEFS_CSV, ERA5_CSV):
+        parquet_path = csv_path.with_suffix(".parquet")
+        if csv_path.exists() or not parquet_path.exists():
+            continue
+        pd.read_parquet(parquet_path).to_csv(csv_path, index=False)
+
+
+_ensure_sample_csvs()
+
+
+def _resolve_sample_dir() -> Path:
+    for cand in (
+        os.environ.get("FORECASTGUARD_SAMPLE_DIR"),
+        str(Path.home() / "Desktop" / "data"),
+        str(GENERATED_SAMPLES),
+    ):
+        if cand and Path(cand).is_dir():
+            return Path(cand)
+    return GENERATED_SAMPLES
+
+
+SAMPLE_DIR = _resolve_sample_dir()
+
+
+def iter_sample_files():
+    exts = {".csv", ".tsv", ".txt", ".xlsx", ".xls", ".json", ".parquet"}
+    for root in {SAMPLE_DIR, GENERATED_SAMPLES}:
+        for p in sorted(Path(root).rglob("*")):
+            if p.is_file() and p.suffix.lower() in exts and "_gefs_parts" not in p.parts:
+                yield p
+
+
+# Samples this big are not parsed by the parametrised parser test. The daily-density
+# fetch writes a full year into data/samples - 675 MB as parquet and 11 GB as CSV for
+# 2017 - and pulling 12.15 million rows into pandas gets the whole pytest process
+# SIGKILLed. It killed the suite twice at 85% before anyone worked out why, because the
+# wrapper's exit code hid the 137.
+#
+# Nothing is lost by skipping them: the test proves that each FORMAT parses, and the
+# 1.6 MB single-year samples are the identical format from the identical writer. What
+# would be lost is the suite.
+PARSE_SIZE_CAP_BYTES = 100 * 1024 * 1024
+
+
+def oversized_samples() -> list:
+    """Sample files excluded from the parser sweep, largest first."""
+    return sorted((p for p in iter_sample_files()
+                   if p.stat().st_size > PARSE_SIZE_CAP_BYTES),
+                  key=lambda p: -p.stat().st_size)
+
+
+def iter_parseable_samples():
+    """Every sample the parser test should actually open."""
+    for p in iter_sample_files():
+        if p.stat().st_size <= PARSE_SIZE_CAP_BYTES:
+            yield p
+
+
+def find_sample(*name_fragments: str) -> Path | None:
+    for p in iter_sample_files():
+        if all(frag.lower() in p.name.lower() for frag in name_fragments):
+            return p
+    return None
+
+
+@pytest.fixture
+def fresh_store():
+    """A clean metadata DB + empty canonical store for one test."""
+    from app.db.base import engine, init_db
+    from app.db.models import Base
+    from app.storage import parquet_store
+
+    Base.metadata.drop_all(engine)
+    shutil.rmtree(parquet_store.CANONICAL_DIR, ignore_errors=True)
+    shutil.rmtree(_TMP / "raw_uploads", ignore_errors=True)
+    init_db()
+    yield
+    Base.metadata.drop_all(engine)
+    shutil.rmtree(parquet_store.CANONICAL_DIR, ignore_errors=True)
+
+
+@pytest.fixture
+def session(fresh_store):
+    from app.db.base import SessionLocal
+
+    s = SessionLocal()
+    try:
+        yield s
+        s.commit()
+    finally:
+        s.close()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    shutil.rmtree(_TMP, ignore_errors=True)

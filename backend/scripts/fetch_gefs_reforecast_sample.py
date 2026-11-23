@@ -1,0 +1,969 @@
+"""Build a real forecast-side sample for Sanket from the NOAA GEFSv12 reforecast.
+
+Source
+------
+NOAA GEFSv12 reforecast, public S3 bucket ``noaa-gefs-retrospective`` (US Government
+work, public domain). 2000-2019, one 00 UTC cycle per day, 5 members (``c00`` control +
+``p01``-``p04``), 0.25 deg global grid, 3-hourly steps. Documentation:
+https://registry.opendata.aws/noaa-gefs-reforecast/  and the bucket's
+``Description_of_reforecast_data.pdf``.
+
+What this script does
+---------------------
+For a set of 00 UTC initialisation dates and all 5 members, it pulls the Day 1-10 forecast
+for eight surface variables, aggregates the 3-hourly data to a daily field per lead day,
+converts to canonical units, and writes **two** artifacts from that one decode:
+
+  * the tabular sample - one wide row per ``(region_id, init_date, member, valid_date)``,
+    where each value is the area-weighted mean over that district's 0.25 deg grid cells.
+    666 districts, not 36 city points: a district is the unit an administration acts on,
+    and a single city point made a whole state's forecast into its capital's forecast.
+  * the gridded fields - ensemble mean and spread per variable and lead day over
+    lon 65-100, lat 2-38, for the convolutional model. See app/ingestion/grid_fields.py.
+
+Both come from the same download. At ~2.3 GB per initialisation, fetching the archive once
+per model family was the thing worth avoiding.
+
+Only the GRIB2 messages actually needed are downloaded, via HTTP ``Range`` requests keyed
+off each file's ``.idx`` sidecar - not the whole 30-70 MB files.
+
+NOTHING here is synthetic. Every value traces to a specific GRIB2 message in the public
+archive (the ``source_grib`` / ``source_msg`` columns record which one).
+
+Lead-time coverage is variable-dependent and is reported honestly at the end:
+  * tmp_2m, spfh_2m, pres_sfc, pres_msl, apcp_sfc, pwat_eatm ... Day 1-10
+  * ugrd_hgt / vgrd_hgt (10 m wind) .................................. Day 1-5 only
+  * soilw_bgrnd (soil moisture) ..................................... ~Day 1-3 only
+The short-coverage variables are kept for the leads they do cover; the ML layer already
+handles variables with sparse rows rather than assuming full Day 1-10.
+
+Usage
+-----
+    python backend/scripts/fetch_gefs_reforecast_sample.py            # full sample
+    python backend/scripts/fetch_gefs_reforecast_sample.py --max-inits 2 --members c00
+    python backend/scripts/fetch_gefs_reforecast_sample.py --resume   # skip done inits
+
+Runs from anywhere; output always lands in ``backend/data/samples/``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, timedelta
+from pathlib import Path
+from typing import Iterable
+
+warnings.filterwarnings("ignore")  # LibreSSL/urllib3 + cfgrib chatter
+
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+import requests
+
+# xarray/cfgrib are NOT imported here. They live in requirements-live.txt, which the test
+# job deliberately does not install - the README's claim that the whole suite runs without
+# the GRIB stack depends on this module staying importable without it. Only extract_grid
+# decodes anything, so the import is deferred to there. The gather job of
+# backfill-reforecast.yml already carries a comment about an earlier version of this exact
+# mistake; a test now pins it.
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.ingestion import grid_fields as gf                            # noqa: E402
+from app.utils.humidity import rh_from_specific_humidity, wind_speed_dir  # noqa: E402,F401
+from app.utils.india_districts import get_aggregator, load_registry    # noqa: E402
+
+# --------------------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------------------
+
+BUCKET = "https://noaa-gefs-retrospective.s3.amazonaws.com"
+REFORECAST_YEAR = 2019
+SCRIPT_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = SCRIPT_DIR.parent
+OUT_DIR = BACKEND_DIR / "data" / "samples"
+GRID_DIR = OUT_DIR / "grids"
+
+ALL_MEMBERS = ["c00", "p01", "p02", "p03", "p04"]
+LEAD_DAYS = list(range(1, 11))  # Day 1 .. Day 10
+
+# Initialisation pattern: one 00 UTC cycle per listed month-day. Fortnightly through the
+# monsoon (Jun-Sep), monthly otherwise, so each year sampled spans the full seasonal cycle
+# including the regime where medium-range busts over India matter most.
+#
+# The same month-days are used for every year, which keeps the seasonal sampling aligned
+# across years - the point of adding years is more *independent monsoons*, not a denser
+# sample of one. Nearby initialisations see largely the same weather, so breadth across
+# years buys far more than density within a year.
+INIT_MMDD = [
+    "01-09", "02-13", "03-13", "04-10", "05-08",
+    "06-05", "06-19", "07-03", "07-17", "07-31",
+    "08-14", "08-28", "09-11", "09-25", "10-16",
+    "11-13", "12-11",
+]
+
+# The reforecast archive runs 2000-2019 (verified against the bucket: every year in that
+# span answers 200 for both the GRIB and its .idx). Anything outside it does not exist.
+ARCHIVE_YEARS = range(2000, 2020)
+
+
+def parse_months(spec: str | None) -> list | None:
+    """`11`, `1-3` or `1,6,12` -> a sorted list of months. Empty or None means all."""
+    if not spec or not str(spec).strip():
+        return None
+    out: set = set()
+    for chunk in str(spec).split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk:
+            a, b = chunk.split("-", 1)
+            out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(chunk))
+    bad = sorted(m for m in out if not 1 <= m <= 12)
+    if bad:
+        raise ValueError(f"not months: {bad}")
+    return sorted(out)
+
+
+def init_dates_for(years, stride: int = 0, months: list | None = None) -> list:
+    """Initialisation dates for the given years.
+
+    ``stride`` 0 keeps the seasonal 17-a-year pattern above. ``stride`` 1 takes every
+    calendar day the archive publishes, 2 every other day, and so on - the archive has one
+    00 UTC cycle per day, so a stride is a straight thinning of it.
+
+    Density is not free and not linear in value. Each extra day multiplies download,
+    storage and training rows alike, while adding far less independent information: the
+    cycle before and the cycle after see largely the same weather, which is the reason the
+    seasonal pattern exists. What density does buy is *complete coverage* - no seasonal
+    gaps to be asked about, and enough events to slice results by season or by district.
+    """
+    if stride <= 0:
+        out = [f"{y}-{md}" for y in years for md in INIT_MMDD]
+    else:
+        out = []
+        for y in years:
+            d, end = date(y, 1, 1), date(y, 12, 31)
+            while d <= end:
+                out.append(d.isoformat())
+                d += timedelta(days=stride)
+    if months:
+        # Filtered on the dates themselves rather than during generation, so this
+        # composes with the seasonal pattern as well as with a stride.
+        keep = set(months)
+        out = [d for d in out if int(d[5:7]) in keep]
+    return out
+
+
+def parse_years(spec: str) -> list:
+    """`2019`, `2010-2019` or `2011,2014,2019` -> a sorted list of years."""
+    out: set = set()
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk:
+            a, b = chunk.split("-", 1)
+            out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(chunk))
+    bad = sorted(y for y in out if y not in ARCHIVE_YEARS)
+    if bad:
+        raise ValueError(f"outside the GEFSv12 reforecast archive (2000-2019): {bad}")
+    return sorted(out)
+
+
+INIT_DATES = init_dates_for([REFORECAST_YEAR])   # default: the original 2019 sample
+
+# GRIB2 file-prefix -> how to read and canonicalise it.
+#   short_name : cfgrib variable key after decode
+#   level_key / level_val : filter when a file holds several levels (wind, soil)
+#   max_lead_h : messages past this are absent in the archive for this variable
+#   accum : APCP-style bucketed accumulation rather than instantaneous samples
+VAR_SPEC: dict[str, dict] = {
+    "tmp_2m":       {"short_name": "t2m",   "max_lead_h": 240, "accum": False},
+    "spfh_2m":      {"short_name": "sh2",   "max_lead_h": 240, "accum": False},
+    "pres_sfc":     {"short_name": "sp",    "max_lead_h": 240, "accum": False},
+    "pres_msl":     {"short_name": "msl",   "max_lead_h": 240, "accum": False},
+    "pwat_eatm":    {"short_name": "pwat",  "max_lead_h": 240, "accum": False},
+    "apcp_sfc":     {"short_name": "tp",    "max_lead_h": 240, "accum": True},
+    "ugrd_hgt":     {"short_name": "u10",   "max_lead_h": 120, "accum": False,
+                     "level_key": "heightAboveGround", "level_val": 10.0},
+    "vgrd_hgt":     {"short_name": "v10",   "max_lead_h": 120, "accum": False,
+                     "level_key": "heightAboveGround", "level_val": 10.0},
+    "soilw_bgrnd":  {"short_name": "soilw", "max_lead_h": 72,  "accum": False,
+                     "level_key": "depthBelowLandLayer", "level_val": 0.0},
+
+    # Predictor-only fields: read for the convolutional model, never paired.
+    #
+    # These carry the predictability signal the surface variables do not. Z500 is the
+    # synoptic pattern - the field a forecaster reads to see a trough arriving, and the
+    # one Rodwell's bust definition is built on. CAPE and CIN are the textbook predictors
+    # of convection, which is what drives rainfall busts, the hardest variable here.
+    #
+    # `grid_only` because there is no observed counterpart: no reanalysis product offers
+    # a "CAPE observation" to verify a CAPE forecast against. Every row in the paired
+    # store is a forecast matched to an observation, so letting these in would create rows
+    # that can never pair and would dilute every count derived from it.
+    "hgt_pres_abv700mb": {"short_name": "gh", "max_lead_h": 240, "accum": False,
+                          "level": "500 mb", "grid_only": True},
+    "cape_sfc":     {"short_name": "cape", "max_lead_h": 240, "accum": False,
+                     "grid_only": True},
+    "cin_sfc":      {"short_name": "cin",  "max_lead_h": 240, "accum": False,
+                     "grid_only": True},
+}
+
+HTTP_RETRIES = 5
+HTTP_BACKOFF = 2.0
+DOWNLOAD_WORKERS = 20
+
+_session = requests.Session()
+_session.headers["User-Agent"] = "Sanket/phase2-sample (SIH 2026)"
+
+
+# --------------------------------------------------------------------------------------
+# HTTP helpers
+# --------------------------------------------------------------------------------------
+
+def _get(url: str, headers: dict | None = None) -> requests.Response:
+    last = None
+    for attempt in range(HTTP_RETRIES):
+        try:
+            r = _session.get(url, headers=headers, timeout=120)
+            if r.status_code in (200, 206):
+                return r
+            if r.status_code == 404:
+                r.raise_for_status()
+            last = requests.HTTPError(f"{r.status_code} for {url}")
+        except (requests.RequestException,) as exc:  # noqa: PERF203
+            last = exc
+        time.sleep(HTTP_BACKOFF * (attempt + 1))
+    raise RuntimeError(f"GET failed after {HTTP_RETRIES} tries: {url}\n  last error: {last}")
+
+
+def key_for(var_prefix: str, init: str, member: str) -> str:
+    """S3 key for a Days:1-10 reforecast GRIB2 file."""
+    ymd = init.replace("-", "")
+    cyc = f"{ymd}00"
+    return (
+        f"GEFSv12/reforecast/{init[:4]}/{cyc}/{member}/Days:1-10/"
+        f"{var_prefix}_{cyc}_{member}.grib2"
+    )
+
+
+# --------------------------------------------------------------------------------------
+# .idx parsing + message selection
+# --------------------------------------------------------------------------------------
+
+class IdxRecord:
+    __slots__ = ("msg", "start", "end", "abbrev", "level", "fcst")
+
+    def __init__(self, msg, start, end, abbrev, level, fcst):
+        self.msg, self.start, self.end = msg, start, end
+        self.abbrev, self.level, self.fcst = abbrev, level, fcst
+
+    def __repr__(self):  # debug aid
+        return f"<msg{self.msg} {self.abbrev}/{self.level}/{self.fcst} [{self.start}:{self.end}]>"
+
+
+def parse_idx(text: str) -> list[IdxRecord]:
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    starts = [int(ln.split(":", 3)[1]) for ln in lines]
+    recs: list[IdxRecord] = []
+    for i, ln in enumerate(lines):
+        parts = ln.split(":")
+        msg = int(parts[0])
+        start = int(parts[1])
+        end = starts[i + 1] if i + 1 < len(starts) else None  # None -> to EOF
+        abbrev = parts[3]
+        level = parts[4]
+        fcst = parts[5] if len(parts) > 5 else ""
+        recs.append(IdxRecord(msg, start, end, abbrev, level, fcst))
+    return recs
+
+
+def _fcst_hour(fcst: str) -> int | None:
+    """'87 hour fcst' -> 87 ; '18-24 hour acc fcst' -> 24 (end of window)."""
+    tok = fcst.split()
+    if not tok:
+        return None
+    head = tok[0]
+    if "-" in head:
+        try:
+            return int(head.split("-")[1])
+        except ValueError:
+            return None
+    try:
+        return int(head)
+    except ValueError:
+        return None
+
+
+def _accum_window(fcst: str) -> tuple[int, int] | None:
+    tok = fcst.split()
+    if not tok or "-" not in tok[0]:
+        return None
+    a, b = tok[0].split("-")
+    return int(a), int(b)
+
+
+def select_for_day(recs: list[IdxRecord], spec: dict, lead_day: int) -> list[IdxRecord]:
+    """Messages whose valid time falls in ((lead_day-1)*24, lead_day*24] hours.
+
+    Instantaneous vars: the 3-hourly samples in the window (typically 8, at
+    +3h..+24h relative to the day start). Accumulation vars: a minimal set of
+    buckets that tile the 24 h exactly, preferring 6-hourly then 3-hourly.
+    """
+    lo, hi = (lead_day - 1) * 24, lead_day * 24
+    if lo >= spec["max_lead_h"]:
+        return []
+
+    # A file may hold many levels. hgt_pres_abv700mb carries 1,440 messages across 18
+    # pressure levels, of which only 80 are 500 mb - and because messages are fetched by
+    # byte range off the .idx, taking just those costs ~16 MB rather than the file's
+    # 296 MB. A level that is absent selects nothing, so the completeness check refuses
+    # the cycle rather than the fetch quietly falling back to a different level.
+    if spec.get("level"):
+        recs = [r for r in recs if r.level.strip() == spec["level"]]
+    elif spec.get("level_key") == "heightAboveGround":
+        recs = [r for r in recs if r.level.strip() == "10 m above ground"]
+    elif spec.get("level_key") == "depthBelowLandLayer":
+        recs = [r for r in recs if r.level.strip() == "0-0.1 m below ground"]
+
+    if not spec.get("accum"):
+        out = []
+        for r in recs:
+            h = _fcst_hour(r.fcst)
+            if h is not None and lo < h <= hi and h <= spec["max_lead_h"]:
+                out.append(r)
+        return out
+
+    # Accumulation: greedily tile [lo, hi] with non-overlapping buckets.
+    buckets = []
+    for r in recs:
+        win = _accum_window(r.fcst)
+        if win and lo <= win[0] and win[1] <= hi and win[1] <= spec["max_lead_h"]:
+            buckets.append((win, r))
+    buckets.sort(key=lambda x: (x[0][0], -(x[0][1] - x[0][0])))  # earlier start, wider first
+    chosen, cursor = [], lo
+    while cursor < hi:
+        step = next((b for b in buckets if b[0][0] == cursor), None)
+        if step is None:
+            break
+        chosen.append(step[1])
+        cursor = step[0][1]
+    return chosen if cursor == hi else []
+
+
+def merge_ranges(recs: Iterable[IdxRecord]) -> list[tuple[int, int | None, list[IdxRecord]]]:
+    """Collapse adjacent byte ranges so contiguous messages download in one GET."""
+    recs = sorted(recs, key=lambda r: r.start)
+    spans: list[tuple[int, int | None, list[IdxRecord]]] = []
+    for r in recs:
+        if spans and spans[-1][1] == r.start:
+            s, _, group = spans.pop()
+            spans.append((s, r.end, group + [r]))
+        else:
+            spans.append((r.start, r.end, [r]))
+    return spans
+
+
+# --------------------------------------------------------------------------------------
+# GRIB decode + point extraction
+# --------------------------------------------------------------------------------------
+
+def extract_grid(grib_bytes: bytes, spec: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Decode concatenated GRIB2 messages onto the stored domain.
+
+    Returns ``(valid_times, field[step, lat, lon])`` in the GRIB's own units. The whole
+    field is kept rather than a handful of sampled points: the district values and the
+    convolutional model's inputs are both derived from it downstream, so one decode of
+    one download serves both model families.
+    """
+    tmp = OUT_DIR / f".decode_{int(time.time()*1e6)}_{id(grib_bytes) & 0xffff}.grib2"
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_bytes(grib_bytes)
+    try:
+        import xarray as xr  # deferred: see the import block at the top of this file
+
+        # Level selection already happened at the .idx stage (select_for_day keeps only
+        # the wanted level's messages), so no cfgrib filter_by_keys is needed here -
+        # and passing one breaks when a single message makes the level coord scalar.
+        ds = xr.open_dataset(tmp, engine="cfgrib", backend_kwargs={"indexpath": ""})
+        var = ds[spec["short_name"]]
+        if "step" not in var.dims:
+            var = var.expand_dims("step")
+        var = var.transpose("step", "latitude", "longitude")
+        vals = var.values
+        stack = np.stack([gf.subset_to_domain(ds["latitude"].values,
+                                              ds["longitude"].values, vals[i])
+                          for i in range(vals.shape[0])])
+        return np.atleast_1d(var["valid_time"].values), stack
+    finally:
+        tmp.unlink(missing_ok=True)
+
+# --------------------------------------------------------------------------------------
+# Canonicalisation
+# --------------------------------------------------------------------------------------
+
+# rh_from_specific_humidity and wind_speed_dir live in app.utils.humidity, shared with the
+# ERA5 observation fetch so the two sides of the bust label cannot drift apart.
+
+
+# canonical wide-column name per grib prefix (post daily-aggregation, pre final unit fix)
+DAILY_AGG = {  # how to collapse 3-hourly -> one value per lead day
+    "tmp_2m": "mean", "spfh_2m": "mean", "pres_sfc": "mean", "pres_msl": "mean",
+    "pwat_eatm": "mean", "apcp_sfc": "sum", "ugrd_hgt": "mean", "vgrd_hgt": "mean",
+    "soilw_bgrnd": "mean",
+    # Instantaneous fields; a daily mean is the right collapse. CAPE peaks in the
+    # afternoon, so the mean understates the peak - a known simplification, recorded
+    # rather than hidden.
+    "hgt_pres_abv700mb": "mean", "cape_sfc": "mean", "cin_sfc": "mean",
+}
+
+
+# --------------------------------------------------------------------------------------
+# Main pull
+# --------------------------------------------------------------------------------------
+
+def pull_one_file(var_prefix: str, init: str, member: str, prepared: np.ndarray):
+    """All covered lead days for one (variable, init, member).
+
+    Returns ``(district_rows, grids)`` - the per-district daily values as long rows, and
+    the daily field per lead day for the gridded artifact. Both come from the same decode
+    of the same download; fetching the archive once per model family would cost another
+    790 GB.
+    """
+    spec = VAR_SPEC[var_prefix]
+    key = key_for(var_prefix, init, member)
+    try:
+        idx_txt = _get(f"{BUCKET}/{key}.idx").text
+    except RuntimeError as exc:
+        print(f"    ! missing idx  {key}  ({exc})", file=sys.stderr)
+        return pd.DataFrame(), {}
+    recs = parse_idx(idx_txt)
+
+    per_day, grids = [], {}
+    for lead in LEAD_DAYS:
+        chosen = select_for_day(recs, spec, lead)
+        if not chosen:
+            continue
+        stacks = []
+        try:
+            for start, end, group in merge_ranges(chosen):
+                rng = f"bytes={start}-{end - 1}" if end is not None else f"bytes={start}-"
+                blob = _get(f"{BUCKET}/{key}", headers={"Range": rng}).content
+                stacks.append(extract_grid(blob, spec)[1])
+        except RuntimeError as exc:
+            # The .idx can survive on the archive after its .grib2 body was dropped - seen
+            # for real on 2008-11-21 p01/soilw_bgrnd, where the index parses fine and lists
+            # real messages but every byte-range GET against the body 404s. Not a transient
+            # fault: retries were exhausted and neighbouring dates fetch fine, so the file
+            # is genuinely absent rather than partially usable. Treat it exactly like a
+            # missing .idx and let cycle_is_complete refuse this one cycle, instead of the
+            # whole multi-year fetch crashing on it.
+            print(f"    ! missing body  {key}  ({exc})", file=sys.stderr)
+            return pd.DataFrame(), {}
+        stack = np.concatenate(stacks, axis=0)
+
+        # Day k is built from forecast hours ((k-1)*24, k*24]; collapse those 3-hourly
+        # samples into one field for the lead day.
+        if DAILY_AGG[var_prefix] == "sum":
+            daily = np.nansum(stack, axis=0)
+        else:
+            daily = np.nanmean(stack, axis=0)
+        # nansum returns 0.0 for a cell that is NaN at every step, which would publish an
+        # uncovered cell as a real zero - and for rainfall a zero is a meaningful forecast.
+        daily = np.where(np.isnan(stack).all(axis=0), np.nan, daily).astype(np.float32)
+        grids[lead] = daily
+
+        vals = get_aggregator().aggregate_prepared(prepared, daily.ravel())
+        # For a 00 UTC init those valid times are calendar day init+(k-1): hours 3 through
+        # 24 all fall on the init day itself, with only the closing +24 h sample landing at
+        # the next midnight. Labelling it init+k (as this script originally did) put every
+        # forecast a day later than its own contents, so each row was verified against the
+        # wrong day's observation - ~8% MAE on average over the 2019 sample, 15-16% on
+        # pressure and precipitable water.
+        per_day.append(pd.DataFrame({
+            "region_id": vals.index.to_numpy(),
+            var_prefix: vals.to_numpy(),
+            "valid_date": pd.Timestamp(init) + pd.Timedelta(days=lead - 1),
+            "init_date": pd.Timestamp(init),
+            "member": member,
+            "lead_day": lead,
+            "source_grib": key,
+            "source_msgs": ",".join(str(r.msg) for r in chosen),
+        }))
+
+    if not per_day:
+        return pd.DataFrame(), {}
+    return pd.concat(per_day, ignore_index=True), grids
+
+
+def cycle_is_complete(results: dict, members: list) -> tuple[bool, str]:
+    """Did every (variable, member) download for this cycle return data?
+
+    Rule 3: an incomplete cycle is rejected, not partially ingested. Without this a cycle
+    that lost three of its five members still writes a parquet part and a grid bundle,
+    `--resume` sees both files and marks that date done forever, and the ensemble spread
+    on those rows is computed over two members instead of five. That does not look wrong
+    downstream - it looks like a calm day. Spread is one of the model's real inputs, so a
+    silently narrow one is a fabricated confidence.
+
+    Checked against the members actually requested, not a hardcoded five, so a deliberate
+    single-member run is still complete.
+    """
+    if not results:
+        return False, "no downloads returned for this cycle"
+    missing = [f"{v}/{m}" for m in members for v in VAR_SPEC
+               if results.get((v, m)) is None or results[(v, m)].empty]
+    if missing:
+        shown = ", ".join(missing[:8])
+        more = f" (+{len(missing) - 8} more)" if len(missing) > 8 else ""
+        return False, (f"{len(missing)} of {len(members) * len(VAR_SPEC)} "
+                       f"variable/member files returned nothing: {shown}{more}")
+    return True, ""
+
+
+def _write_grid_bundle(init: str, grids_by: dict, members: list) -> Path | None:
+    """Collapse the members into ensemble mean and spread, and store the fields.
+
+    Mean and spread rather than the raw members: five members at float32 is 11.25 GB over
+    the archive against 2.25 GB for two statistics, and mean and spread are what the
+    ensemble is actually saying - its best guess, and its own confidence in it. Spread is
+    the population standard deviation across members, so a single-member run yields zero
+    spread rather than an undefined one.
+    """
+    variables = tuple(VAR_SPEC)
+    leads = tuple(LEAD_DAYS)
+    lats, lons = gf.domain_coords()
+    values = np.full((len(variables), len(leads), len(gf.STATS), len(lats), len(lons)),
+                     np.nan, dtype=np.float32)
+
+    for vi, vp in enumerate(variables):
+        for li, lead in enumerate(leads):
+            planes = [grids_by[(vp, m)][lead] for m in members
+                      if (vp, m) in grids_by and lead in grids_by[(vp, m)]]
+            if not planes:
+                continue  # variable does not reach this lead day; stays NaN
+            stack = np.stack(planes)
+            allnan = np.isnan(stack).all(axis=0)
+            mean = np.where(allnan, np.nan, np.nanmean(stack, axis=0))
+            spread = np.where(allnan, np.nan, np.nanstd(stack, axis=0))
+            values[vi, li, 0] = mean
+            values[vi, li, 1] = spread
+
+    if np.isnan(values).all():
+        return None
+    bundle = gf.GridBundle(init, variables, leads, lats, lons, values)
+    return gf.save_bundle(GRID_DIR / f"{init}.npz", bundle)
+
+
+def build(inits: list, members: list, resume: bool, no_csv: bool = False) -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    GRID_DIR.mkdir(parents=True, exist_ok=True)
+    part_dir = OUT_DIR / "_gefs_parts"
+    part_dir.mkdir(exist_ok=True)
+
+    # The domain is fixed, so the mapping from weight rows into a ravelled field is built
+    # once for the whole run rather than per field - 400 aggregations per cycle, 82x
+    # faster prepared than not.
+    lat2d, lon2d = np.meshgrid(*gf.domain_coords(), indexing="ij")
+    prepared = get_aggregator().prepare(lat2d.ravel(), lon2d.ravel())
+    refused: list[tuple[str, str]] = []
+
+    for init in inits:
+        part_path = part_dir / f"{init}.parquet"
+        grid_path = GRID_DIR / f"{init}.npz"
+        if resume and part_path.exists() and grid_path.exists():
+            print(f"= {init}  (cached, skipping)")
+            continue
+        t0 = time.time()
+        print(f"* {init}  members={','.join(members)}")
+
+        merged: pd.DataFrame | None = None
+        jobs = [(vp, init, m) for m in members for vp in VAR_SPEC]
+        results: dict[tuple[str, str], pd.DataFrame] = {}
+        grids_by: dict[tuple[str, str], dict] = {}
+        with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+            fut = {pool.submit(pull_one_file, vp, init, m, prepared): (vp, m)
+                   for vp, init_, m in jobs}
+            for f in as_completed(fut):
+                vp, m = fut[f]
+                df, grids = f.result()
+                results[(vp, m)] = df
+                grids_by[(vp, m)] = grids
+                n = 0 if df.empty else len(df)
+                print(f"    {vp:<12} {m}  rows={n}  grids={len(grids)}")
+
+        complete, why = cycle_is_complete(results, members)
+        if not complete:
+            # Refused, not partially written - and deliberately NOT cached, so a retry
+            # picks it up rather than `--resume` treating a broken cycle as done.
+            print(f"    ! REFUSED {init}: {why}", file=sys.stderr)
+            refused.append((init, why))
+            del grids_by
+            continue
+
+        written = _write_grid_bundle(init, grids_by, members)
+        if written is not None:
+            print(f"    grid  -> {written.name}  {written.stat().st_size/1e6:.2f} MB")
+        del grids_by  # ~33 MB of fields per cycle; do not carry it into the next one
+
+        # assemble wide table keyed by (region_id, init_date, member, lead_day,
+        # valid_date): first stack every member for a given variable, then merge one
+        # column per variable across the shared keys (no column-name collisions that way).
+        keys = ["region_id", "init_date", "member", "lead_day", "valid_date"]
+        for vp in (v for v in VAR_SPEC if not VAR_SPEC[v].get("grid_only")):
+            parts = [df for (v, _m), df in results.items() if v == vp and not df.empty]
+            if not parts:
+                continue
+            stacked = pd.concat(parts, ignore_index=True)
+            stacked = stacked[keys + ["source_grib", "source_msgs", vp]].rename(
+                columns={"source_grib": f"src_{vp}", "source_msgs": f"srcmsg_{vp}"}
+            )
+            merged = stacked if merged is None else merged.merge(stacked, on=keys, how="outer")
+
+        if merged is None or merged.empty:
+            print(f"    (no data for {init})")
+            continue
+
+        merged = _canonicalise(merged)
+        merged.to_parquet(part_path, index=False)
+        print(f"  -> {part_path.name}  {len(merged):,} rows  {time.time()-t0:,.0f}s")
+
+    if refused:
+        # Named individually: at 366 cycles "a cycle failed" is not enough to know
+        # whether to retry the date or whether the archive lacks it.
+        print(f"\n{len(refused)} cycle(s) REFUSED as incomplete:", file=sys.stderr)
+        for init, why in refused:
+            print(f"  {init}  {why}", file=sys.stderr)
+
+    _finalise(part_dir, sorted({int(i[:4]) for i in inits}), no_csv=no_csv)
+
+
+def _canonicalise(df: pd.DataFrame) -> pd.DataFrame:
+    """Raw GEFS columns -> canonical units and derived fields."""
+    out = df.copy()
+
+    if "tmp_2m" in out:
+        out["t2m_c"] = out["tmp_2m"] - 273.15
+    if {"spfh_2m", "tmp_2m", "pres_sfc"}.issubset(out.columns):
+        out["rh2m_pct"] = rh_from_specific_humidity(
+            out["spfh_2m"].to_numpy(), out["tmp_2m"].to_numpy(), out["pres_sfc"].to_numpy()
+        )
+    if "pres_msl" in out:
+        out["mslp_hpa"] = out["pres_msl"] / 100.0
+    if "pres_sfc" in out:
+        out["psfc_hpa"] = out["pres_sfc"] / 100.0
+    if "pwat_eatm" in out:
+        out["pwat_kgm2"] = out["pwat_eatm"]
+    if "apcp_sfc" in out:
+        out["apcp_mm"] = out["apcp_sfc"]  # kg m-2 == mm
+    if {"ugrd_hgt", "vgrd_hgt"}.issubset(out.columns):
+        spd, drc = wind_speed_dir(out["ugrd_hgt"].to_numpy(), out["vgrd_hgt"].to_numpy())
+        out["wspd10m_ms"], out["wdir10m_deg"] = spd, drc
+    if "soilw_bgrnd" in out:
+        out["soilw_vol_pct"] = out["soilw_bgrnd"] * 100.0
+
+    meta = pd.DataFrame([
+        {"region_id": d.region_id, "region_name": d.region_name,
+         "state_id": d.state_id, "state_name": d.state_name,
+         "latitude": d.centroid_lat, "longitude": d.centroid_lon}
+        for d in load_registry()
+    ])
+    out = out.merge(meta, on="region_id", how="left")
+    unknown = out["region_name"].isna().sum()
+    if unknown:
+        raise SystemExit(f"{unknown} rows carry a region_id absent from the registry")
+
+    # latitude/longitude are the district centroid, kept so a consumer can place the
+    # region on a map. They are NOT where the value was read: every value is the
+    # area-weighted mean over the district's grid cells, not a point sample.
+    canon = [
+        "region_id", "region_name", "state_id", "state_name", "latitude", "longitude",
+        "init_date", "valid_date", "lead_day", "member",
+        "t2m_c", "rh2m_pct", "apcp_mm", "mslp_hpa", "psfc_hpa",
+        "pwat_kgm2", "wspd10m_ms", "wdir10m_deg", "soilw_vol_pct",
+    ]
+    src_cols = sorted(c for c in out.columns if c.startswith(("src_", "srcmsg_")))
+    keep = [c for c in canon if c in out.columns] + src_cols
+    out = out[keep].sort_values(
+        ["region_id", "init_date", "member", "lead_day"]).reset_index(drop=True)
+    out["init_date"] = pd.to_datetime(out["init_date"]).dt.date
+    out["valid_date"] = pd.to_datetime(out["valid_date"]).dt.date
+    return out
+
+
+def _refuse_if_git_tracked(path: Path) -> None:
+    """A finalise target that git already tracks is, twice now, a committed test fixture
+    of the same name rather than a stray leftover - and overwriting it produced no error
+    of its own, just a fixture that was silently wrong until `git status` caught it after
+    the fact. Refuse before a single part is read rather than rely on catching this again.
+
+    Deliberately a refusal, not a silent rename: someone finalising into a tracked path
+    needs to choose the real target themselves (see --no-csv's sibling, `--source` on
+    the ingest side), not have it renamed for them without asking.
+
+    Degrades to "allow" outside a git repo (a fresh clone's temp dir, CI's own scratch
+    space) - there is nothing to check against, so nothing to refuse.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", str(path)],
+            cwd=path.parent, capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if result.returncode == 0:
+        raise SystemExit(
+            f"{path} is tracked by git - finalising here would silently overwrite a "
+            f"committed file (most likely a test fixture of the same name, as happened "
+            f"with 2019's legacy 36-city sample). Pass an explicit output path instead "
+            f"of letting this land on a tracked file.")
+
+
+def _replace_with_retry(tmp: Path, dest: Path, tries: int = 8, delay: float = 0.5) -> None:
+    """`Path.replace()` raised `PermissionError: [WinError 32]` renaming a freshly-written
+    year file into place on Windows - twice in a row, with the write itself already
+    complete. Some other process (Windows Defender's real-time scan, VS Code's file
+    watcher, the search indexer - all three were running) briefly had the destination
+    open; POSIX rename has no such restriction, so this is Windows-only and, empirically,
+    transient. Retrying with backoff clears it without risking the data, which was
+    already fully written to `tmp` before this is ever called.
+    """
+    last: PermissionError | None = None
+    for attempt in range(tries):
+        try:
+            tmp.replace(dest)
+            return
+        except PermissionError as exc:
+            last = exc
+            if attempt < tries - 1:
+                time.sleep(delay * (attempt + 1))
+    raise last
+
+
+def _finalise(part_dir: Path, years: list, no_csv: bool = False) -> None:
+    """Write one CSV/parquet per year, from that year's cached parts.
+
+    Per year, and only for the years this run asked for, on purpose. An earlier version
+    globbed every part into a single file named 2019 - so a run limited to one member
+    silently rewrote the committed 2019 sample 1,440 rows short (36 cities x 4 missing
+    members x 10 leads), and `git status` stayed clean because the CSV is gitignored.
+    Scoping the write to the requested years makes that impossible.
+    """
+    for year in years:
+        parts = sorted(part_dir.glob(f"{year}-*.parquet"))
+        if not parts:
+            print(f"No parts for {year}; nothing to finalise.", file=sys.stderr)
+            continue
+
+        # A part written before the move to districts is keyed by `city`, not
+        # `region_id`. Concatenating the two schemas would not fail - pandas would take
+        # the union of the columns and fill the rest with NaN - so it would quietly
+        # publish a year that is half district rows and half city rows, each missing the
+        # other's key. Refuse instead, and say which files to delete.
+        stale = [q for q in parts
+                 if "region_id" not in pq.ParquetFile(q).schema_arrow.names]
+        if stale:
+            raise SystemExit(
+                f"{len(stale)} of {len(parts)} cached parts for {year} predate the move "
+                f"to districts and are keyed by city:\n  "
+                + "\n  ".join(str(q) for q in stale[:5])
+                + (f"\n  ... and {len(stale) - 5} more" if len(stale) > 5 else "")
+                + "\nDelete them and re-fetch those initialisations."
+            )
+        _write_year(parts, year, no_csv=no_csv)
+
+
+def _write_year(parts: list, year: int, no_csv: bool = False) -> None:
+    """Stream a year's parts into one Parquet (and, unless `no_csv`, one CSV), a part at
+    a time.
+
+    This used to pd.concat every part first. A district part is ~71 MB in pandas (the
+    src_* provenance strings dominate), so a year at daily density is ~26 GB before
+    concat's own copy - measured 2026-09-11, and it cannot be held on a 16 GB machine.
+    Each part becomes one row group, which also lets the ingest's init_date filter skip
+    straight to the cycle it wants.
+
+    Both files are written under a .partial name and renamed only when every part is in:
+    a year file that stopped at part 200 would otherwise look like a finished, shorter
+    year to the next step.
+
+    `no_csv` exists because a district-scale year's CSV twin is tens of GB (measured
+    ~12 GB for one year at daily density) and nothing reads it - the ingest, the training
+    pipeline and every test read the parquet. Skipping it also sidesteps a Windows-only
+    failure mode: the search indexer holds a rename lock on a freshly-written multi-GB
+    text file far longer than on the binary parquet, which cost four failed finalise
+    attempts on the RTX 4060 box before this flag existed.
+    """
+    import pyarrow as pa
+    import pyarrow.csv as pacsv
+
+    csv_path = OUT_DIR / f"gefs_reforecast_india_{year}.csv"
+    pq_path = OUT_DIR / f"gefs_reforecast_india_{year}.parquet"
+    csv_tmp = csv_path.with_name(csv_path.name + ".partial")
+    pq_tmp = pq_path.with_name(pq_path.name + ".partial")
+
+    _refuse_if_git_tracked(pq_path)
+    if not no_csv:
+        _refuse_if_git_tracked(csv_path)
+
+    value_cols = ["t2m_c", "rh2m_pct", "apcp_mm", "mslp_hpa", "psfc_hpa",
+                  "pwat_kgm2", "wspd10m_ms", "wdir10m_deg", "soilw_vol_pct"]
+    stat_cols = ["region_id", "state_id", "init_date", "member", "valid_date", "lead_day"]
+    rows, districts, states, inits, members = 0, set(), set(), set(), set()
+    vmin = vmax = None
+    cov = None
+
+    schema = None
+    pq_writer = csv_writer = None
+    try:
+        for q in parts:
+            table = pq.read_table(q)
+            if schema is None:
+                schema = table.schema
+                pq_writer = pq.ParquetWriter(pq_tmp, schema)
+                if not no_csv:
+                    csv_writer = pacsv.CSVWriter(csv_tmp, schema.remove_metadata())
+            elif not table.schema.equals(schema, check_metadata=False):
+                try:
+                    table = table.cast(schema)
+                except (pa.ArrowInvalid, ValueError) as exc:
+                    raise SystemExit(f"{q.name} does not match the schema of {parts[0].name}: "
+                                     f"{exc}") from exc
+            pq_writer.write_table(table)
+            if csv_writer is not None:
+                csv_writer.write_table(table.replace_schema_metadata(None))
+
+            s = table.select([c for c in stat_cols + value_cols
+                              if c in table.column_names]).to_pandas()
+            rows += len(s)
+            districts.update(s["region_id"].unique())
+            states.update(s["state_id"].unique())
+            inits.update(s["init_date"].unique())
+            members.update(s["member"].unique())
+            lo, hi = s["valid_date"].min(), s["valid_date"].max()
+            vmin = lo if vmin is None else min(vmin, lo)
+            vmax = hi if vmax is None else max(vmax, hi)
+            vc = [c for c in value_cols if c in s.columns]
+            c = s.groupby("lead_day")[vc].count()
+            cov = c if cov is None else cov.add(c, fill_value=0).astype(int)
+    finally:
+        if pq_writer is not None:
+            pq_writer.close()
+        if csv_writer is not None:
+            csv_writer.close()
+
+    _replace_with_retry(pq_tmp, pq_path)
+    if no_csv:
+        csv_tmp.unlink(missing_ok=True)
+    else:
+        _replace_with_retry(csv_tmp, csv_path)
+
+    print("\n" + "=" * 78)
+    print(f"FORECAST SAMPLE  ->  {'(csv skipped)' if no_csv else csv_path.relative_to(BACKEND_DIR)}")
+    print(f"                     {pq_path.relative_to(BACKEND_DIR)}")
+    print("=" * 78)
+    print(f"rows            : {rows:,}")
+    print(f"districts       : {len(districts)}")
+    print(f"states/UTs      : {len(states)}")
+    print(f"init cycles      : {len(inits)}  ({min(inits)} .. {max(inits)})")
+    print(f"members         : {sorted(members)}")
+    print(f"valid dates      : {vmin} .. {vmax}")
+    print("\nnon-null value counts by canonical variable and lead day:")
+    with pd.option_context("display.width", 160, "display.max_columns", 30):
+        print(cov.to_string())
+    print("\nEvery row's values are reproducible from the src_<var> / srcmsg_<var> columns.")
+
+
+# --------------------------------------------------------------------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--years", default=str(REFORECAST_YEAR), metavar="SPEC",
+                    help="which reforecast years to sample: 2019, 2010-2019, or "
+                         "2011,2014,2019. Archive covers 2000-2019 (default: 2019).")
+    ap.add_argument("--inits", default=None, metavar="DATES",
+                    help="explicit comma list of YYYY-MM-DD init dates, instead of the "
+                         "seasonal pattern. Used by CI to split a year across parallel "
+                         "jobs; --years is ignored when this is given.")
+    ap.add_argument("--shard", default=None, metavar="I/N",
+                    help="take every Nth init date starting at I (1-based), for splitting "
+                         "a fetch across parallel CI jobs. Strided rather than contiguous "
+                         "so a failed shard thins the seasonal sample evenly instead of "
+                         "removing a whole quarter.")
+    ap.add_argument("--months", default=None, metavar="SPEC",
+                    help="restrict to these months: 11, 1-3, or 1,6,12. A year at daily "
+                         "density is ~842 GB, too much for one 6-hour Actions job, so CI "
+                         "matrices the year by month.")
+    ap.add_argument("--stride", type=int, default=0, metavar="DAYS",
+                    help="take every Nth calendar day instead of the 17-a-year seasonal "
+                         "pattern: 1 = every day the archive has, 2 = every other day. "
+                         "Multiplies download, storage and training rows by roughly 365/N "
+                         "over 17 - see init_dates_for.")
+    ap.add_argument("--max-inits", type=int, default=None, help="use only the first N init dates")
+    ap.add_argument("--members", default=",".join(ALL_MEMBERS),
+                    help="comma list, subset of c00,p01,p02,p03,p04")
+    ap.add_argument("--resume", action="store_true", help="skip init dates already in _gefs_parts/")
+    ap.add_argument("--list-only", action="store_true", help="print the plan and exit")
+    ap.add_argument("--no-csv", action="store_true",
+                    help="skip the CSV twin - a district-scale year's CSV is tens of GB "
+                         "and nothing reads it; only the parquet is used downstream")
+    args = ap.parse_args()
+
+    if args.inits:
+        inits = [d.strip() for d in args.inits.split(",") if d.strip()]
+        bad = [d for d in inits if len(d) != 10 or int(d[:4]) not in ARCHIVE_YEARS]
+        if bad:
+            sys.exit(f"bad or out-of-archive init dates: {bad}")
+        years = sorted({int(d[:4]) for d in inits})
+    else:
+        try:
+            years = parse_years(args.years)
+        except ValueError as exc:
+            sys.exit(str(exc))
+        try:
+            months = parse_months(args.months)
+        except ValueError as exc:
+            sys.exit(str(exc))
+        inits = init_dates_for(years, stride=args.stride, months=months)
+    if args.shard:
+        try:
+            i, n = (int(x) for x in args.shard.split("/", 1))
+            if not (1 <= i <= n):
+                raise ValueError
+        except ValueError:
+            sys.exit(f"--shard must look like 1/4, got {args.shard!r}")
+        inits = inits[i - 1::n]
+    if args.max_inits is not None:
+        inits = inits[: args.max_inits]
+    members = [m.strip() for m in args.members.split(",") if m.strip()]
+    bad = set(members) - set(ALL_MEMBERS)
+    if bad:
+        sys.exit(f"unknown members: {sorted(bad)}")
+
+    est_files = len(inits) * len(members) * len(VAR_SPEC)
+    # ~460 MB of GRIB per (init, member) - measured, not estimated.
+    est_gb = len(inits) * len(members) * 0.46
+    print(f"years={years[0]}..{years[-1]} ({len(years)})  "
+          f"districts={len(load_registry())}  inits={len(inits)}  members={len(members)}  "
+          f"variables={len(VAR_SPEC)}  -> ~{est_files} GRIB files, "
+          f"~{est_files * 8} range GETs, ~{est_gb:,.0f} GB to transfer")
+    if args.list_only:
+        for i in inits:
+            print("  init", i)
+        return
+
+    build(inits, members, resume=args.resume, no_csv=args.no_csv)
+
+
+if __name__ == "__main__":
+    main()
